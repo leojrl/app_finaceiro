@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import base64
+import hashlib
+import importlib
 import logging
 import os
 import re
@@ -9,7 +12,6 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
-import bcrypt
 import firebase_admin
 import streamlit as st
 from firebase_admin import credentials, firestore
@@ -20,6 +22,7 @@ from streamlit.errors import StreamlitSecretNotFoundError
 LOGGER = logging.getLogger(__name__)
 USERNAME_PATTERN = re.compile(r"^[a-zA-Z0-9_.-]{3,32}$")
 MAX_AMOUNT_CENTS = 999_999_999_999
+PASSWORD_HASH_ITERATIONS = 600_000
 
 
 def validate_username(value: str) -> str:
@@ -30,11 +33,57 @@ def validate_username(value: str) -> str:
 
 
 def validate_password(value: str) -> None:
-    encoded_password = value.encode("utf-8")
     if len(value) < 8:
         raise ValueError("A senha deve ter pelo menos 8 caracteres.")
-    if len(encoded_password) > 72:
-        raise ValueError("A senha deve ter no máximo 72 bytes em UTF-8.")
+
+
+def hash_password(password: str) -> str:
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt,
+        PASSWORD_HASH_ITERATIONS,
+    )
+    encoded_salt = base64.urlsafe_b64encode(salt).decode("ascii")
+    encoded_digest = base64.urlsafe_b64encode(digest).decode("ascii")
+    return f"pbkdf2_sha256${PASSWORD_HASH_ITERATIONS}${encoded_salt}${encoded_digest}"
+
+
+def verify_password(password: str, stored_hash: str) -> tuple[bool, str | None]:
+    if stored_hash.startswith("pbkdf2_sha256$"):
+        try:
+            algorithm, iteration_text, encoded_salt, encoded_digest = stored_hash.split("$")
+            iterations = int(iteration_text)
+            if algorithm != "pbkdf2_sha256" or not 100_000 <= iterations <= 2_000_000:
+                raise ValueError("Parâmetros inválidos para hash de senha.")
+            salt = base64.urlsafe_b64decode(encoded_salt.encode("ascii"))
+            expected_digest = base64.urlsafe_b64decode(encoded_digest.encode("ascii"))
+        except (ValueError, UnicodeEncodeError) as error:
+            raise RuntimeError("A conta está inconsistente. Entre em contato com o suporte.") from error
+
+        actual_digest = hashlib.pbkdf2_hmac(
+            "sha256", password.encode("utf-8"), salt, iterations
+        )
+        return secrets.compare_digest(actual_digest, expected_digest), None
+
+    if stored_hash.startswith(("$2a$", "$2b$", "$2y$")):
+        try:
+            bcrypt = importlib.import_module("bcrypt")
+        except ModuleNotFoundError as error:
+            raise RuntimeError(
+                "Esta conta usa um formato antigo. Inclua bcrypt no requirements.txt "
+                "e reinicie o aplicativo para entrar e migrar a senha."
+            ) from error
+        if len(password.encode("utf-8")) > 72:
+            return False, None
+        try:
+            matches = bcrypt.checkpw(password.encode("utf-8"), stored_hash.encode("ascii"))
+        except (ValueError, UnicodeEncodeError) as error:
+            raise RuntimeError("A conta está inconsistente. Entre em contato com o suporte.") from error
+        return matches, hash_password(password) if matches else None
+
+    raise RuntimeError("A conta está inconsistente. Entre em contato com o suporte.")
 
 
 def parse_amount(value: str) -> int:
@@ -69,7 +118,21 @@ def get_firestore_client() -> firestore.Client:
             )
         firebase_credential = credentials.Certificate(str(credential_file))
     elif firebase_config:
-        firebase_credential = credentials.Certificate(dict(firebase_config))
+        config_dict = dict(firebase_config)
+        pk = str(config_dict.get("private_key", ""))
+        if "COLE_AQUI" in pk or "ID_DO_PROJETO" in str(config_dict.get("project_id", "")):
+            raise RuntimeError(
+                "As credenciais do Firebase nos Secrets contêm o texto de exemplo "
+                "('COLE_AQUI_A_CHAVE_PRIVADA_COMPLETA' ou 'ID_DO_PROJETO'). "
+                "Substitua os Secrets pelo conteúdo configurado em .streamlit/secrets.toml."
+            )
+        try:
+            firebase_credential = credentials.Certificate(config_dict)
+        except Exception as err:
+            raise RuntimeError(
+                f"Erro ao carregar a chave privada do Firebase nos Secrets: {err}. "
+                "Verifique se o bloco 'private_key' foi copiado com as quebras de linha e delimitadores corretos."
+            ) from err
     else:
         app_directory = Path(__file__).resolve().parent
         candidates = list(app_directory.glob("*firebase-adminsdk*.json"))
@@ -148,12 +211,7 @@ def authenticate_user(db: firestore.Client, username: str, password: str) -> dic
     password_hash = user_data.get("password_hash")
     if not isinstance(password_hash, str):
         raise RuntimeError("A conta está inconsistente. Entre em contato com o suporte.")
-    if len(password.encode("utf-8")) > 72:
-        return None
-    try:
-        password_matches = bcrypt.checkpw(password.encode("utf-8"), password_hash.encode("ascii"))
-    except (ValueError, UnicodeEncodeError) as error:
-        raise RuntimeError("A conta está inconsistente. Entre em contato com o suporte.") from error
+    password_matches, upgraded_hash = verify_password(password, password_hash)
     if not password_matches:
         return None
 
@@ -161,6 +219,8 @@ def authenticate_user(db: firestore.Client, username: str, password: str) -> dic
     display_name = user_data.get("display_name")
     if not isinstance(stored_username, str) or not isinstance(display_name, str):
         raise RuntimeError("A conta está inconsistente. Entre em contato com o suporte.")
+    if upgraded_hash is not None:
+        db.collection("users").document(uid).update({"password_hash": upgraded_hash})
     return {"uid": uid, "username": stored_username, "display_name": display_name}
 
 
@@ -313,9 +373,7 @@ def render_authentication(db: firestore.Client) -> None:
             try:
                 username = validate_username(new_username_input)
                 validate_password(new_password)
-                password_hash = bcrypt.hashpw(
-                    new_password.encode("utf-8"), bcrypt.gensalt()
-                ).decode("ascii")
+                password_hash = hash_password(new_password)
                 if register_user(db, username, password_hash, username):
                     st.session_state["auth_mode"] = "login"
                     st.session_state["auth_message"] = "Conta criada! Entre com seu usuário e senha."
