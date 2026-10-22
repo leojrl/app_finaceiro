@@ -1,3 +1,4 @@
 streamlit>=1.40,<2
 firebase-admin>=6.5,<8
+google-genai>=1.0,<2
 bcrypt>=4.2,<6
