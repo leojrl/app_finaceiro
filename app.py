@@ -410,18 +410,17 @@ def render_transaction_form(
     with st.form(form_key):
         if is_editing:
             type_index = 0 if transaction["type"] == "receita" else 1
+            transaction_type = st.selectbox(
+                "Tipo",
+                ["receita", "despesa"],
+                index=type_index,
+                format_func=lambda value: "Salário" if value == "receita" else "Despesa (Gasto)",
+                key=f"{form_key}_type",
+            )
         elif salary_entry:
-            type_index = 0
+            transaction_type = "receita"
         else:
-            type_index = 1  # Padrão para novo gasto é sempre despesa!
-
-        transaction_type = st.selectbox(
-            "Tipo",
-            ["receita", "despesa"],
-            index=type_index,
-            format_func=lambda value: "Receita" if value == "receita" else "Despesa (Gasto)",
-            key=f"{form_key}_type",
-        )
+            transaction_type = "despesa"
         description = st.text_input(
             "Descrição",
             value=transaction["description"] if is_editing else "Salário" if salary_entry else "",
@@ -476,7 +475,7 @@ def render_transaction_form(
             save_transaction(db, user["uid"], transaction["id"] if is_editing else None, transaction_data)
             st.session_state["page"] = "home"
             st.session_state["saved_message"] = (
-                "Salário salvo como receita." if transaction_type == "receita" else "Gasto registrado com sucesso."
+                "Salário salvo com sucesso." if transaction_type == "receita" else "Gasto registrado com sucesso."
             )
             st.rerun()
         except ValueError as error:
@@ -524,7 +523,7 @@ def answer_financial_ai_question(
             )
 
     financial_context = {
-        "receitas_centavos": income_cents,
+        "salario_centavos": income_cents,
         "despesas_centavos": expense_cents,
         "saldo_centavos": balance_cents,
         "despesas_por_categoria_centavos": category_totals,
@@ -576,41 +575,76 @@ def render_home(db: firestore.Client, user: dict[str, str]) -> None:
     current_month = date.today().strftime("%Y-%m")
     if current_month not in available_months:
         available_months.insert(0, current_month)
-    month_options = ["Todos os meses", *available_months]
-    if st.session_state.get("selected_month") not in month_options:
+    month_options = available_months
+    if st.session_state.get("selected_month") not in available_months:
         st.session_state["selected_month"] = current_month
 
     display_name = user.get("display_name") or user.get("username")
 
-    st.sidebar.title("Aplicativo financeiro")
-    st.sidebar.caption(f"Usuário: {display_name}")
-    st.sidebar.divider()
-    if st.sidebar.button("Visão geral", key="sb_home", use_container_width=True):
+    st.sidebar.markdown(
+        '<div class="sidebar-brand"><span class="sidebar-brand-mark">✓</span>'
+        '<span><strong>nuvem</strong><small>FINANÇAS</small></span></div>'
+        '<div class="sidebar-section-label">MENU PRINCIPAL</div>',
+        unsafe_allow_html=True,
+    )
+    if st.sidebar.button("▦  Visão geral", key="sb_home", use_container_width=True):
         st.session_state["page"] = "home"
+        st.session_state["show_gestao"] = False
+        st.session_state["show_reports"] = False
         st.rerun()
-    if st.sidebar.button("➕ Adicionar salário", key="sb_salary", use_container_width=True):
+    if st.sidebar.button("▤  Lançamentos", key="sb_transactions", use_container_width=True):
+        st.session_state["page"] = "home"
+        st.session_state["show_gestao"] = True
+        st.session_state["show_reports"] = False
+        st.rerun()
+    if st.sidebar.button("▥  Relatórios", key="sb_reports", use_container_width=True):
+        st.session_state["page"] = "home"
+        st.session_state["show_gestao"] = False
+        st.session_state["show_reports"] = True
+        st.rerun()
+    if st.sidebar.button("＋  Salário", key="sb_salary", use_container_width=True):
         st.session_state["page"] = "salary"
         st.rerun()
-    if st.sidebar.button("➕ Adicionar gasto", key="sb_expense", use_container_width=True):
+    if st.sidebar.button("−  Despesas", key="sb_expense", use_container_width=True):
         st.session_state["page"] = "create"
         st.session_state["default_type"] = "despesa"
         st.rerun()
-
-    selected_month = st.selectbox(
-        "Mês de referência",
-        month_options,
-        format_func=lambda value: value if value == "Todos os meses" else month_label(value),
-        key="selected_month",
+    st.sidebar.markdown(
+        '<div class="sidebar-section-label sidebar-preferences">SUA CONTA</div>',
+        unsafe_allow_html=True,
+    )
+    st.sidebar.markdown(
+        f'<div class="sidebar-profile"><span class="profile-avatar">'
+        f'{html.escape(str(display_name)[:1].upper())}</span>'
+        f'<span><strong>{html.escape(str(display_name))}</strong>'
+        '<small>Conta pessoal</small></span></div>',
+        unsafe_allow_html=True,
     )
 
-    if selected_month == "Todos os meses":
-        displayed_records = records
-        period_label = "Todos os meses"
-    else:
-        displayed_records = [item for item in records if item["date"].startswith(selected_month)]
-        period_label = month_label(selected_month)
+    if st.session_state.get("saved_message"):
+        st.success(st.session_state.pop("saved_message"))
 
-    # Totais
+    today = date.today()
+    weekday_names = ("segunda-feira", "terça-feira", "quarta-feira", "quinta-feira", "sexta-feira", "sábado", "domingo")
+    date_text = f"{weekday_names[today.weekday()].capitalize()}, {today.day:02d} de {month_label(today.strftime('%Y-%m')).split(' de ')[0].lower()} de {today.year}"
+    header_col, month_col = st.columns([3, 1.2], vertical_alignment="center")
+    with header_col:
+        st.markdown(
+            f'<div class="welcome-header"><div class="welcome-date">{html.escape(date_text)}</div>'
+            f'<h1>Olá, {html.escape(str(display_name))} 👋</h1>'
+            '<p>Veja como estão suas finanças neste mês.</p></div>',
+            unsafe_allow_html=True,
+        )
+    with month_col:
+        selected_month = st.selectbox(
+            "Mês de referência",
+            month_options,
+            format_func=month_label,
+            key="selected_month",
+            label_visibility="collapsed",
+        )
+    displayed_records = [item for item in records if item["date"].startswith(selected_month)]
+    period_label = month_label(selected_month)
     income_total = sum(
         item["amount_cents"] for item in displayed_records if item["type"] == "receita"
     )
@@ -618,125 +652,201 @@ def render_home(db: firestore.Client, user: dict[str, str]) -> None:
         item["amount_cents"] for item in displayed_records if item["type"] == "despesa"
     )
     balance = income_total - expense_total
-
-    if st.session_state.get("saved_message"):
-        st.success(st.session_state.pop("saved_message"))
-
-    st.markdown(
-        f'<div class="dashboard-heading">'
-        f'<div><div class="dashboard-eyebrow">VISÃO GERAL · {html.escape(period_label.upper())}</div>'
-        f'<h1>Olá, {html.escape(str(display_name))} 👋</h1>'
-        f'<p>Acompanhe suas finanças e planeje os próximos passos.</p></div>'
-        f'<div class="dashboard-mark">💸</div>'
-        f'</div>',
-        unsafe_allow_html=True,
-    )
-
-    # 1. Resumo de receitas, despesas e saldo
+    committed_share = min(expense_total / income_total, 1.0) if income_total else 0.0
     st.markdown(
         f'<div class="metrics-row">'
-        f'  <div class="metric-card metric-income">'
-        f'    <div class="metric-label">Receita</div>'
-        f'    <div class="metric-val">{money(income_total)}</div>'
-        f'  </div>'
-        f'  <div class="metric-card metric-expense">'
-        f'    <div class="metric-label">Despesas</div>'
-        f'    <div class="metric-val">{money(expense_total)}</div>'
-        f'  </div>'
-        f'  <div class="metric-card metric-balance">'
-        f'    <div class="metric-label">Saldo que restou</div>'
-        f'    <div class="metric-val">{money(balance)}</div>'
-        f'  </div>'
+        f'<div class="metric-card metric-income"><div class="metric-label">Salário recebido</div>'
+        f'<div class="metric-val">{money(income_total)}</div>'
+        f'<div class="metric-note">✓ &nbsp; Recebido em {html.escape(period_label)}</div></div>'
+        f'<div class="metric-card metric-expense"><div class="metric-label">Despesas do mês</div>'
+        f'<div class="metric-val">{money(expense_total)}</div>'
+        f'<div class="metric-note">{committed_share:.0%} do salário utilizado</div>'
+        f'<div class="metric-progress"><span style="width:{committed_share:.0%}"></span></div></div>'
+        f'<div class="metric-card metric-balance"><div class="metric-label">Saldo disponível</div>'
+        f'<div class="metric-val">{money(balance)}</div>'
+        f'<div class="metric-note">Disponível para seus planos</div></div>'
         f'</div>',
         unsafe_allow_html=True,
     )
 
-    # 2. Gráfico de despesas por categoria
-    expenses_by_category: dict[str, float] = {}
-    for item in displayed_records:
-        if item["type"] == "despesa":
-            expenses_by_category[item["category"]] = (
-                expenses_by_category.get(item["category"], 0) + item["amount_cents"] / 100
-            )
-
-    if expenses_by_category:
-        st.bar_chart(
-            {
-                "Categoria": list(expenses_by_category),
-                "Gastos (R$)": list(expenses_by_category.values()),
-            },
-            x="Categoria",
-            y="Gastos (R$)",
-            height=220,
+    chart_col, actions_col = st.columns([1.9, 1], gap="medium")
+    with chart_col:
+        st.markdown(
+            '<div class="section-heading"><div><h2>Visão financeira</h2>'
+            '<p>Acompanhe a evolução do seu dinheiro</p></div></div>',
+            unsafe_allow_html=True,
         )
+        month_keys = sorted(
+            {
+                item["date"][:7]
+                for item in records
+                if isinstance(item.get("date"), str)
+                and item["date"][:7] <= current_month
+            }
+        )[-6:]
+        if not month_keys:
+            month_keys = [current_month]
+        chart_data = []
+        for month_key in month_keys:
+            month_records = [item for item in records if item["date"].startswith(month_key)]
+            chart_data.append(
+                {
+                    "Mês": month_label(month_key)[:3],
+                    "Salário": sum(
+                        item["amount_cents"] for item in month_records if item["type"] == "receita"
+                    ) / 100,
+                    "Despesas": sum(
+                        item["amount_cents"] for item in month_records if item["type"] == "despesa"
+                    ) / 100,
+                }
+            )
+        st.line_chart(
+            chart_data,
+            x="Mês",
+            y=["Salário", "Despesas"],
+            color=["#21B985", "#E79070"],
+            height=280,
+        )
+        if st.session_state.get("show_reports"):
+            expense_categories: dict[str, float] = {}
+            for item in displayed_records:
+                if item["type"] == "despesa":
+                    category = str(item.get("category", "Sem categoria"))
+                    expense_categories[category] = (
+                        expense_categories.get(category, 0) + item["amount_cents"] / 100
+                    )
+            st.markdown(
+                '<div class="section-heading"><div><h2>Despesas por categoria</h2>'
+                '<p>Distribuição dos gastos no mês selecionado</p></div></div>',
+                unsafe_allow_html=True,
+            )
+            if expense_categories:
+                st.bar_chart(
+                    {
+                        "Categoria": list(expense_categories),
+                        "Gastos (R$)": list(expense_categories.values()),
+                    },
+                    x="Categoria",
+                    y="Gastos (R$)",
+                    height=220,
+                )
+            else:
+                st.info("Ainda não há despesas para este mês.")
+
+    with actions_col:
+        st.markdown(
+            '<div class="section-heading"><div><h2>Acesso rápido</h2>'
+            '<p>O que você deseja fazer?</p></div></div>',
+            unsafe_allow_html=True,
+        )
+        if st.button("＋  Adicionar salário", key="quick_add_salary", use_container_width=True):
+            st.session_state["page"] = "salary"
+            st.rerun()
+        if st.button("−  Adicionar gasto", key="quick_add_expense", use_container_width=True):
+            st.session_state["page"] = "create"
+            st.session_state["default_type"] = "despesa"
+            st.rerun()
+        st.markdown(
+            f'<div class="commitment-card"><div class="commitment-title">Renda comprometida'
+            f'<strong>{committed_share:.0%}</strong></div>'
+            f'<div class="metric-progress"><span style="width:{committed_share:.0%}"></span></div>'
+            f'<small>{money(expense_total)} de {money(income_total)} do salário</small></div>',
+            unsafe_allow_html=True,
+        )
+
+    st.markdown(
+        f'<div class="section-heading recent-heading"><div><h2>Lançamentos recentes</h2>'
+        f'<p>Suas movimentações em {html.escape(period_label)}</p></div>'
+        f'<span class="record-count">{len(displayed_records)} lançamentos</span></div>',
+        unsafe_allow_html=True,
+    )
+    if not displayed_records:
+        st.info("Nenhum lançamento neste mês. Adicione seu salário ou um gasto para começar.")
     else:
-        st.info("Suas despesas por categoria aparecerão aqui quando você registrar um gasto.")
-
-    # 3. Ação principal para adicionar gasto
-    if st.button("➕ Adicionar gasto", key="btn_center_add_expense", type="primary", use_container_width=True):
-        st.session_state["page"] = "create"
-        st.session_state["default_type"] = "despesa"
-        st.rerun()
-
-    # 4. Painel de gestão financeira
-    gestao_open = st.session_state.get("show_gestao", False)
-    if st.button(
-        "📊 Ocultar Gestão Financeira" if gestao_open else "📊 Gestão Financeira",
-        key="btn_gestao_financeira",
-        use_container_width=True,
-    ):
-        st.session_state["show_gestao"] = not gestao_open
-        st.rerun()
-
-    # Painel de Gestão Financeira (aberto ao clicar no botão de Gestão Financeira)
-    if gestao_open:
-        with st.container(border=True):
-            st.markdown("### 📊 Painel de Gestão Financeira")
-            if income_total:
-                committed_share = expense_total / income_total
-                st.markdown(f"**Renda Comprometida:** {committed_share:.0%} da receita")
-                st.progress(min(committed_share, 1.0))
-
-            st.markdown(f"#### 📋 Gerenciamento de Lançamentos ({len(displayed_records)})")
-            if not displayed_records:
-                st.info("Nenhum lançamento registrado neste período.")
-
-            for record in displayed_records:
-                is_income = record["type"] == "receita"
-                sign = "+" if is_income else "−"
-                amount_class = "income" if is_income else "expense"
-                with st.container(border=True):
-                    d_col, a_col = st.columns([3, 2])
-                    with d_col:
-                        st.markdown(f"**{record['description']}**")
-                        st.caption(f"{record['category']} · {date.fromisoformat(record['date']).strftime('%d/%m/%Y')}")
-                    with a_col:
-                        st.markdown(f'<div class="amount {amount_class}">{sign} {money(record["amount_cents"])}</div>', unsafe_allow_html=True)
-
-                    ed_col, dl_col = st.columns(2)
-                    with ed_col:
-                        if st.button("Editar", key=f"edit_{record['id']}", use_container_width=True):
-                            st.session_state["editing_transaction"] = record
-                            st.session_state["page"] = "edit"
-                            st.rerun()
-                    with dl_col:
-                        delete_key = f"confirm_del_{record['id']}"
-                        if st.session_state.get("delete_transaction_id") == record["id"]:
-                            if st.button("Confirmar exclusão", key=delete_key, use_container_width=True):
-                                try:
-                                    delete_transaction(db, user["uid"], record["id"])
-                                    st.session_state.pop("delete_transaction_id", None)
-                                    st.success("Lançamento excluído com sucesso.")
-                                    st.rerun()
-                                except Exception as error:
-                                    st.error(str(error))
-                            if st.button("Cancelar", key=f"cancel_{record['id']}", use_container_width=True):
+        for record in displayed_records[:5]:
+            is_income = record["type"] == "receita"
+            sign = "+" if is_income else "−"
+            amount_class = "income" if is_income else "expense"
+            icon = "＋" if is_income else "−"
+            description = html.escape(str(record.get("description", "Lançamento")))
+            category = html.escape(str(record.get("category", "Sem categoria")))
+            transaction_day = date.fromisoformat(record["date"]).strftime("%d %b")
+            with st.container():
+                record_cols = st.columns([0.55, 4.5, 1.7, 1.1, 0.85, 0.85], vertical_alignment="center")
+                with record_cols[0]:
+                    st.markdown(
+                        f'<div class="record-icon {amount_class}">{icon}</div>',
+                        unsafe_allow_html=True,
+                    )
+                with record_cols[1]:
+                    st.markdown(
+                        f'<div class="record-description"><strong>{description}</strong>'
+                        f'<small>{category} · {transaction_day}</small></div>',
+                        unsafe_allow_html=True,
+                    )
+                with record_cols[2]:
+                    st.markdown(
+                        f'<div class="record-amount {amount_class}">{sign} {money(record["amount_cents"])}</div>',
+                        unsafe_allow_html=True,
+                    )
+                with record_cols[3]:
+                    if st.button("Editar", key=f"edit_{record['id']}", use_container_width=True):
+                        st.session_state["editing_transaction"] = record
+                        st.session_state["page"] = "edit"
+                        st.rerun()
+                with record_cols[4]:
+                    delete_key = f"del_{record['id']}"
+                    if st.session_state.get("delete_transaction_id") == record["id"]:
+                        if st.button("Confirmar", key=f"confirm_{record['id']}", use_container_width=True):
+                            try:
+                                delete_transaction(db, user["uid"], record["id"])
                                 st.session_state.pop("delete_transaction_id", None)
+                                st.success("Lançamento excluído com sucesso.")
                                 st.rerun()
-                        else:
-                            if st.button("Excluir", key=f"del_{record['id']}", use_container_width=True):
-                                st.session_state["delete_transaction_id"] = record["id"]
+                            except (GoogleAPICallError, PermissionError, RuntimeError) as error:
+                                report_database_error("excluir o lançamento", error)
+                    elif st.button("Excluir", key=delete_key, use_container_width=True):
+                        st.session_state["delete_transaction_id"] = record["id"]
+                        st.rerun()
+                with record_cols[5]:
+                    if st.session_state.get("delete_transaction_id") == record["id"]:
+                        if st.button("Cancelar", key=f"cancel_{record['id']}", use_container_width=True):
+                            st.session_state.pop("delete_transaction_id", None)
+                            st.rerun()
+
+    if len(displayed_records) > 5:
+        st.caption(f"Mostrando 5 de {len(displayed_records)} lançamentos. Use o menu Lançamentos para gerenciar todos.")
+
+    if st.session_state.get("show_gestao"):
+        with st.expander(f"Gerenciar lançamentos ({len(displayed_records)})", expanded=True):
+            if not displayed_records:
+                st.info("Não há lançamentos para gerenciar neste período.")
+            for record in displayed_records:
+                manage_cols = st.columns([4, 1, 1], vertical_alignment="center")
+                with manage_cols[0]:
+                    st.write(
+                        f"{record.get('description', 'Lançamento')} · "
+                        f"{record.get('category', 'Sem categoria')} · "
+                        f"{money(record['amount_cents'])}"
+                    )
+                with manage_cols[1]:
+                    if st.button("Editar", key=f"manage_edit_{record['id']}", use_container_width=True):
+                        st.session_state["editing_transaction"] = record
+                        st.session_state["page"] = "edit"
+                        st.rerun()
+                with manage_cols[2]:
+                    if st.session_state.get("delete_transaction_id") == record["id"]:
+                        if st.button("Confirmar", key=f"manage_confirm_{record['id']}", use_container_width=True):
+                            try:
+                                delete_transaction(db, user["uid"], record["id"])
+                                st.session_state.pop("delete_transaction_id", None)
+                                st.success("Lançamento excluído com sucesso.")
                                 st.rerun()
+                            except (GoogleAPICallError, PermissionError, RuntimeError) as error:
+                                report_database_error("excluir o lançamento", error)
+                    elif st.button("Excluir", key=f"manage_delete_{record['id']}", use_container_width=True):
+                        st.session_state["delete_transaction_id"] = record["id"]
+                        st.rerun()
 
     # 5. Chat de dúvidas financeiras
     st.markdown(
@@ -818,8 +928,8 @@ def main() -> None:
     st.set_page_config(
         page_title="Aplicativo financeiro",
         page_icon="💸",
-        layout="centered",
-        initial_sidebar_state="collapsed",
+        layout="wide",
+        initial_sidebar_state="expanded",
     )
     st.markdown(
         """
@@ -840,36 +950,43 @@ def main() -> None:
 
         /* ── Main Container ── */
         .block-container {
-            max-width: 1140px;
-            padding: 1.8rem 1.5rem 6rem;
+            max-width: 1480px;
+            padding: 2rem 2.2rem 5rem;
         }
 
         /* ── Hide Streamlit branding ── */
-        #MainMenu, footer, header { visibility: hidden; }
+        #MainMenu, footer { visibility: hidden; }
+        header[data-testid="stHeader"] {
+            visibility: visible;
+            background: transparent;
+        }
 
         /* ── Sidebar ── */
         [data-testid="stSidebar"] {
-            background: linear-gradient(180deg, #0f4d3a 0%, #126b55 100%) !important;
-            border-right: none !important;
+            background: #ffffff !important;
+            border-right: 1px solid #edf1ee !important;
         }
         [data-testid="stSidebar"] * {
-            color: #e2e8f0 !important;
+            color: #53635e;
         }
         [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] h1 {
-            color: #ffffff !important;
+            color: #173a32 !important;
             font-size: 1.3rem;
             font-weight: 800;
         }
         [data-testid="stSidebar"] div.stButton > button {
             text-align: left;
-            background: rgba(255,255,255,0.08) !important;
-            border: 1px solid rgba(255,255,255,0.12) !important;
-            color: #ffffff !important;
+            background: transparent !important;
+            border: 1px solid transparent !important;
+            color: #697672 !important;
             border-radius: 12px !important;
+            min-height: 44px;
+            font-size: 0.88rem !important;
         }
         [data-testid="stSidebar"] div.stButton > button:hover {
-            background: rgba(255,255,255,0.18) !important;
-            border-color: rgba(255,255,255,0.3) !important;
+            background: #eaf6f1 !important;
+            border-color: #d9eee4 !important;
+            color: #176b50 !important;
         }
 
         /* ── Brand Title (Login) ── */
@@ -937,6 +1054,153 @@ def main() -> None:
             background: linear-gradient(145deg, #ecfdf5, #d1fae5);
             font-size: 1.65rem;
         }
+
+        .sidebar-brand {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin: 0.5rem 0 2rem;
+        }
+        .sidebar-brand-mark {
+            display: grid;
+            width: 42px;
+            height: 42px;
+            place-items: center;
+            border-radius: 14px;
+            background: #173a32;
+            color: #55e0b0 !important;
+            font-size: 1.4rem;
+            font-weight: 800;
+        }
+        .sidebar-brand strong, .sidebar-brand small,
+        .sidebar-profile strong, .sidebar-profile small {
+            display: block;
+        }
+        .sidebar-brand strong {
+            color: #173a32 !important;
+            font-size: 1.1rem;
+            line-height: 1.15;
+        }
+        .sidebar-brand small {
+            margin-top: 3px;
+            color: #84918e !important;
+            font-size: 0.58rem;
+            letter-spacing: 0.16em;
+        }
+        .sidebar-section-label {
+            margin: 0.6rem 0 0.5rem 0.5rem;
+            color: #84918e !important;
+            font-size: 0.65rem;
+            font-weight: 750;
+            letter-spacing: 0.12em;
+        }
+        .sidebar-preferences {
+            margin-top: 2rem;
+            padding-top: 1.4rem;
+            border-top: 1px solid #eef1ef;
+        }
+        .sidebar-profile {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-top: 1rem;
+            padding: 0.6rem 0.3rem;
+        }
+        .profile-avatar {
+            display: grid;
+            width: 36px;
+            height: 36px;
+            flex: 0 0 36px;
+            place-items: center;
+            border-radius: 50%;
+            background: #dcebe5;
+            color: #276650 !important;
+            font-size: 0.8rem;
+            font-weight: 700;
+        }
+        .sidebar-profile strong {
+            color: #26352f !important;
+            font-size: 0.78rem;
+        }
+        .sidebar-profile small {
+            margin-top: 2px;
+            color: #84918e !important;
+            font-size: 0.68rem;
+        }
+        .welcome-header { padding: 0.15rem 0 1rem; }
+        .welcome-date { color: #84918e; font-size: 0.76rem; }
+        .welcome-header h1 {
+            margin: 0.45rem 0 0.3rem;
+            color: #172522;
+            font-size: clamp(1.55rem, 2.4vw, 2rem);
+            font-weight: 750;
+            letter-spacing: -0.04em;
+        }
+        .welcome-header p, .section-heading p {
+            margin: 0;
+            color: #84918e;
+            font-size: 0.82rem;
+        }
+        .section-heading {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin: 0.7rem 0 0.75rem;
+        }
+        .section-heading h2 {
+            margin: 0 0 0.25rem;
+            color: #172522;
+            font-size: 1rem;
+            font-weight: 700;
+        }
+        .recent-heading { margin-top: 1.6rem; }
+        .record-count { color: #84918e; font-size: 0.75rem; }
+        .commitment-card {
+            margin-top: 1.2rem;
+            padding: 1rem;
+            border: 1px solid #edf1ee;
+            border-radius: 15px;
+            background: #fff;
+        }
+        .commitment-title {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 0.75rem;
+            color: #46534f;
+            font-size: 0.78rem;
+            font-weight: 650;
+        }
+        .commitment-title strong { color: #21885f; font-size: 0.95rem; }
+        .commitment-card small { display: block; margin-top: 0.65rem; color: #84918e; font-size: 0.68rem; }
+        .metric-progress {
+            height: 7px;
+            overflow: hidden;
+            border-radius: 99px;
+            background: #edf1ee;
+        }
+        .metric-progress span {
+            display: block;
+            height: 100%;
+            border-radius: inherit;
+            background: #27b887;
+        }
+        .record-icon {
+            display: grid;
+            width: 34px;
+            height: 34px;
+            place-items: center;
+            border-radius: 50%;
+            font-weight: 700;
+        }
+        .record-icon.income { background: #eaf6f0; color: #21885f; }
+        .record-icon.expense { background: #fff2ed; color: #d87455; }
+        .record-description strong, .record-description small { display: block; }
+        .record-description strong { color: #26352f; font-size: 0.8rem; }
+        .record-description small { margin-top: 3px; color: #84918e; font-size: 0.68rem; }
+        .record-amount { text-align: right; font-size: 0.78rem; font-weight: 700; }
+        .record-amount.income { color: #21885f; }
+        .record-amount.expense { color: #b95e46; }
 
         /* ── Form Cards ── */
         div[data-testid="stForm"] {
@@ -1110,8 +1374,8 @@ def main() -> None:
         .metrics-row {
             display: grid;
             grid-template-columns: repeat(3, minmax(0, 1fr));
-            gap: 12px;
-            margin-bottom: 1.4rem;
+            gap: 16px;
+            margin: 0.7rem 0 1rem;
             width: 100%;
         }
         .metric-card {
@@ -1120,8 +1384,8 @@ def main() -> None:
             background: #ffffff;
             border: 1px solid rgba(0, 0, 0, 0.05);
             border-radius: 18px;
-            padding: 20px 14px;
-            text-align: center;
+            padding: 21px 22px;
+            text-align: left;
             box-shadow: 0 6px 18px rgba(15,23,42,0.045), 0 1px 3px rgba(15,23,42,0.02);
             transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
             position: relative;
@@ -1143,21 +1407,30 @@ def main() -> None:
             box-shadow: 0 12px 28px rgba(0, 0, 0, 0.08);
         }
         .metric-label {
-            font-size: 0.72rem;
+            font-size: 0.78rem;
             font-weight: 700;
             color: #64748b;
             margin-bottom: 6px;
-            text-transform: uppercase;
-            letter-spacing: 0.06em;
+            text-transform: none;
+            letter-spacing: 0;
         }
         .metric-val {
-            font-size: clamp(1rem, 2.5vw, 1.5rem);
-            font-weight: 900;
+            margin: 0.7rem 0;
+            font-size: clamp(1.25rem, 2.5vw, 1.75rem);
+            font-weight: 750;
             letter-spacing: -0.02em;
         }
-        .metric-income .metric-val { color: #059669; }
-        .metric-expense .metric-val { color: #dc2626; }
-        .metric-balance .metric-val { color: #0284c7; }
+        .metric-income {
+            background: linear-gradient(135deg, #173a32 0%, #0d1e1c 100%);
+            border-color: #173a32;
+        }
+        .metric-income .metric-label, .metric-income .metric-note { color: #b8cbc4; }
+        .metric-income .metric-val { color: #ffffff; }
+        .metric-expense .metric-val { color: #172522; }
+        .metric-balance .metric-val { color: #172522; }
+        .metric-note { color: #84918e; font-size: 0.72rem; }
+        .metric-income .metric-note { color: #82e7c3; }
+        .metric-expense .metric-progress { margin-top: 0.75rem; }
         .metric-val { white-space: nowrap; }
 
         /* ── Logout Button ── */
@@ -1265,6 +1538,37 @@ def main() -> None:
             .block-container {
                 max-width: 100% !important;
                 padding: 0.65rem 0.7rem 2rem !important;
+            }
+            [data-testid="stSidebar"] {
+                min-width: 17rem;
+            }
+            .metrics-row {
+                grid-template-columns: 1fr;
+                gap: 9px;
+            }
+            .metric-card {
+                padding: 15px 16px;
+            }
+            .metric-balance {
+                grid-column: auto;
+            }
+            .metric-val {
+                font-size: 1.35rem;
+            }
+            .record-count {
+                display: none;
+            }
+            .record-description strong {
+                font-size: 0.72rem;
+            }
+            .record-amount {
+                font-size: 0.68rem;
+                white-space: nowrap;
+            }
+            .st-key-quick_add_salary button,
+            .st-key-quick_add_expense button {
+                min-height: 42px !important;
+                font-size: 0.8rem !important;
             }
             div[data-testid="stForm"] {
                 max-width: 100%;
