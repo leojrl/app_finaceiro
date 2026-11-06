@@ -5,6 +5,7 @@ import calendar
 import hashlib
 import html
 import importlib
+import io
 import json
 import logging
 import os
@@ -367,7 +368,7 @@ def register_user(
     return bool(run_in_transaction(db, create_account))
 
 
-def authenticate_user(db: firestore.Client, username: str, password: str) -> dict[str, str] | None:
+def authenticate_user(db: Any, username: str, password: str) -> dict[str, Any] | None:
     username_snapshot = db.collection("usernames").document(username).get()
     if not username_snapshot.exists:
         return None
@@ -395,7 +396,69 @@ def authenticate_user(db: firestore.Client, username: str, password: str) -> dic
         raise RuntimeError("A conta está inconsistente. Entre em contato com o suporte.")
     if upgraded_hash is not None:
         db.collection("users").document(uid).update({"password_hash": upgraded_hash})
-    return {"uid": uid, "username": stored_username, "display_name": display_name}
+    return {
+        "uid": uid,
+        "username": stored_username,
+        "display_name": display_name,
+        "age": user_data.get("age", ""),
+        "gender": user_data.get("gender", ""),
+        "workplace": user_data.get("workplace", ""),
+        "job_role": user_data.get("job_role", ""),
+        "photo_data_url": user_data.get("photo_data_url", ""),
+    }
+
+
+def get_user_profile(db: Any, user: dict[str, Any]) -> dict[str, Any]:
+    uid = str(user.get("uid", ""))
+    if not uid:
+        return dict(user)
+    try:
+        snapshot = db.collection("users").document(uid).get()
+        if snapshot.exists:
+            data = snapshot.to_dict() or {}
+            merged = dict(user)
+            for key in ("display_name", "age", "gender", "workplace", "job_role", "photo_data_url"):
+                if key in data and data[key] is not None:
+                    merged[key] = data[key]
+            st.session_state["user"] = merged
+            return merged
+    except Exception:
+        pass
+    return dict(user)
+
+
+def save_user_profile(db: Any, uid: str, profile_updates: dict[str, Any]) -> None:
+    payload = dict(profile_updates)
+    payload["updated_at"] = datetime.now(timezone.utc)
+    db.collection("users").document(uid).set(payload, merge=True)
+    if "user" in st.session_state and isinstance(st.session_state["user"], dict):
+        st.session_state["user"].update(profile_updates)
+
+
+def process_uploaded_photo(uploaded_file: Any) -> str:
+    raw_bytes = uploaded_file.getvalue()
+    if len(raw_bytes) > 8 * 1024 * 1024:
+        raise ValueError("A foto deve ter no máximo 8 MB.")
+    try:
+        pil_image = importlib.import_module("PIL.Image")
+        pil_ops = importlib.import_module("PIL.ImageOps")
+        image = pil_image.open(io.BytesIO(raw_bytes))
+        image = pil_ops.exif_transpose(image)
+        image = image.convert("RGB")
+        width, height = image.size
+        side = min(width, height)
+        left = (width - side) // 2
+        top = (height - side) // 2
+        image = image.crop((left, top, left + side, top + side))
+        image = image.resize((240, 240))
+        out = io.BytesIO()
+        image.save(out, format="JPEG", quality=85, optimize=True)
+        encoded = base64.b64encode(out.getvalue()).decode("ascii")
+        return f"data:image/jpeg;base64,{encoded}"
+    except Exception:
+        mime = getattr(uploaded_file, "type", "image/jpeg") or "image/jpeg"
+        encoded = base64.b64encode(raw_bytes).decode("ascii")
+        return f"data:{mime};base64,{encoded}"
 
 
 def list_transactions(db: Any, uid: str) -> list[dict[str, Any]]:
@@ -460,17 +523,29 @@ def iter_months(start_month: str, end_month: str) -> list[str]:
 
 def infer_recurring_kind(record: dict[str, Any]) -> str | None:
     explicit_kind = record.get("recurring_kind")
+    if explicit_kind == "extra":
+        return None
     if explicit_kind in ("salary", "vale"):
         return str(explicit_kind)
     if record.get("type") != "receita":
         return None
     category = str(record.get("category", "")).strip().lower()
     description = str(record.get("description", "")).strip().lower()
+    if any(term in category or term in description for term in ("bico", "extra", "freela", "comissão", "comissao")):
+        return None
     if "vale" in category or "vale" in description or "adiantamento" in category:
         return "vale"
     if category in ("salário", "salario") or description in ("salário", "salario"):
         return "salary"
     return None
+
+
+def is_extra_income_record(record: dict[str, Any]) -> bool:
+    if record.get("type") != "receita":
+        return False
+    if record.get("recurring_kind") == "extra":
+        return True
+    return infer_recurring_kind(record) is None
 
 
 def get_recurring_configs(db: firestore.Client, uid: str) -> dict[str, dict[str, Any]]:
@@ -938,23 +1013,135 @@ def _render_recurring_income_tab(
             report_database_error(f"salvar o {label_lower}", error)
 
 
-def render_income_tabs(db: firestore.Client, user: dict[str, str]) -> None:
-    st.subheader("Lançar Salário e Vale")
+def _render_extra_income_tab(
+    db: Any,
+    user: dict[str, Any],
+    records: list[dict[str, Any]],
+) -> None:
+    today = date.today()
+    current_month = today.strftime("%Y-%m")
+    month_extras = [
+        item
+        for item in records
+        if str(item.get("date", "")).startswith(current_month)
+        and is_extra_income_record(item)
+    ]
+    total_extras_cents = sum(int(item.get("amount_cents", 0)) for item in month_extras)
+
+    st.markdown(
+        f'<div class="recurring-banner extra-banner">'
+        f'<div class="recurring-banner-icon">⚡</div>'
+        f'<div class="recurring-banner-text">'
+        f'<strong>Dinheiro Extra e Bicos no mês: {money(total_extras_cents)}</strong>'
+        f'<span>Registre bicos, freelas, vendas, horas extras ou comissões. '
+        f'O valor é somado ao seu saldo na data do recebimento.</span>'
+        f'</div></div>',
+        unsafe_allow_html=True,
+    )
+
+    with st.form("transaction_form_extra"):
+        description = st.text_input(
+            "Descrição do bico / dinheiro extra",
+            placeholder="Ex.: Bico fim de semana, Freela, Venda extra, Comissão...",
+            max_chars=100,
+            key="form_extra_description",
+        )
+        col_val, col_cat = st.columns(2)
+        with col_val:
+            amount_text = st.text_input(
+                "Valor recebido (R$)",
+                placeholder="Ex.: 180,00",
+                max_chars=15,
+                key="form_extra_amount",
+            )
+        with col_cat:
+            category = st.selectbox(
+                "Tipo de ganho extra",
+                [
+                    "Bico",
+                    "Freela / Serviço Extra",
+                    "Hora Extra / Comissão",
+                    "Venda Extra",
+                    "Outros Ganhos Extras",
+                ],
+                key="form_extra_category",
+            )
+        transaction_date = st.date_input(
+            "Data do recebimento",
+            value=today,
+            key="form_extra_date",
+        )
+        save_extra = st.form_submit_button(
+            "⚡ Adicionar dinheiro extra / bico",
+            use_container_width=True,
+            type="primary",
+        )
+
+    if save_extra:
+        try:
+            clean_description = description.strip() or category
+            amount_cents = parse_amount(amount_text)
+            transaction_data = {
+                "type": "receita",
+                "description": clean_description,
+                "amount_cents": amount_cents,
+                "category": category,
+                "date": transaction_date.isoformat(),
+                "recurring_kind": "extra",
+            }
+            save_transaction(db, user["uid"], None, transaction_data)
+            st.session_state["selected_month"] = transaction_date.strftime("%Y-%m")
+            st.session_state["page"] = "home"
+            st.session_state["saved_message"] = (
+                f"Dinheiro extra ({clean_description} — {money(amount_cents)}) adicionado com sucesso!"
+            )
+            st.rerun()
+        except ValueError as error:
+            st.error(str(error))
+        except (GoogleAPICallError, RuntimeError) as error:
+            report_database_error("salvar o dinheiro extra", error)
+
+    if month_extras:
+        st.markdown("#### ⚡ Bicos e ganhos extras deste mês")
+        for extra in month_extras[:5]:
+            desc = html.escape(str(extra.get("description", "Bico")))
+            cat = html.escape(str(extra.get("category", "Bico")))
+            day_str = date.fromisoformat(extra["date"]).strftime("%d/%m/%Y")
+            st.markdown(
+                f'<div class="extra-item-row">'
+                f'<div><strong>⚡ {desc}</strong><small>{cat} · {day_str}</small></div>'
+                f'<span class="extra-item-val">+ {money(int(extra["amount_cents"]))}</span>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+
+def render_income_tabs(db: Any, user: dict[str, Any]) -> None:
+    st.subheader("Receitas: Salário, Vale e Dinheiro Extra (Bicos)")
     if st.session_state.get("saved_message"):
         st.success(st.session_state.pop("saved_message"))
 
     try:
         records = list_transactions(db, user["uid"])
-        _, configs = sync_recurring_income(db, user["uid"], records)
+        records, configs = sync_recurring_income(db, user["uid"], records)
     except (GoogleAPICallError, RuntimeError) as error:
         report_database_error("carregar configurações de salário e vale", error)
+        records = []
         configs = {}
 
-    prefer_vale = st.session_state.get("income_tab") == "vale"
-    if prefer_vale:
-        tab_vale, tab_salary = st.tabs(["💳 Lançar Vale", "💰 Lançar Salário"])
+    active_tab = st.session_state.get("income_tab", "salary")
+    if active_tab == "vale":
+        tab_vale, tab_salary, tab_extra = st.tabs(
+            ["💳 Lançar Vale", "💰 Lançar Salário", "⚡ Dinheiro Extra / Bico"]
+        )
+    elif active_tab == "extra":
+        tab_extra, tab_salary, tab_vale = st.tabs(
+            ["⚡ Dinheiro Extra / Bico", "💰 Lançar Salário", "💳 Lançar Vale"]
+        )
     else:
-        tab_salary, tab_vale = st.tabs(["💰 Lançar Salário", "💳 Lançar Vale"])
+        tab_salary, tab_vale, tab_extra = st.tabs(
+            ["💰 Lançar Salário", "💳 Lançar Vale", "⚡ Dinheiro Extra / Bico"]
+        )
 
     with tab_salary:
         _render_recurring_income_tab(db, user, "salary", configs.get("salary"))
@@ -962,9 +1149,146 @@ def render_income_tabs(db: firestore.Client, user: dict[str, str]) -> None:
     with tab_vale:
         _render_recurring_income_tab(db, user, "vale", configs.get("vale"))
 
-    if st.button("Voltar", key="income_tabs_back", use_container_width=True):
+    with tab_extra:
+        _render_extra_income_tab(db, user, records)
+
+    if st.button("Voltar para Visão Geral", key="income_tabs_back", use_container_width=True):
         st.session_state["page"] = "home"
         st.rerun()
+
+
+def render_profile_page(db: Any, user: dict[str, Any]) -> None:
+    profile = get_user_profile(db, user)
+    display_name = str(profile.get("display_name") or profile.get("username") or "Usuário")
+    current_age = profile.get("age", "")
+    current_gender = str(profile.get("gender") or "Não informado")
+    current_workplace = str(profile.get("workplace") or "")
+    current_role = str(profile.get("job_role") or "")
+    photo_url = str(profile.get("photo_data_url") or "")
+
+    st.subheader("👤 Meu Perfil")
+    if st.session_state.get("saved_message"):
+        st.success(st.session_state.pop("saved_message"))
+
+    avatar_html = (
+        f'<img src="{photo_url}" class="profile-page-photo" alt="Foto de perfil">'
+        if photo_url
+        else f'<div class="profile-page-avatar">{html.escape(display_name[:1].upper())}</div>'
+    )
+    meta_badges = []
+    if current_workplace:
+        meta_badges.append(f"🏢 {html.escape(current_workplace)}")
+    if current_role:
+        meta_badges.append(f"💼 {html.escape(current_role)}")
+    if current_age:
+        meta_badges.append(f"🎂 {html.escape(str(current_age))} anos")
+    if current_gender and current_gender != "Não informado":
+        meta_badges.append(f"👤 {html.escape(current_gender)}")
+    badges_html = (
+        "".join(f'<span class="profile-badge">{b}</span>' for b in meta_badges)
+        if meta_badges
+        else '<span class="profile-badge">Complete seus dados abaixo</span>'
+    )
+
+    st.markdown(
+        f'<div class="profile-hero-card">'
+        f'{avatar_html}'
+        f'<div class="profile-hero-info">'
+        f'<h2>{html.escape(display_name)}</h2>'
+        f'<p>@{html.escape(str(profile.get("username", "")))}</p>'
+        f'<div class="profile-badges-row">{badges_html}</div>'
+        f'</div></div>',
+        unsafe_allow_html=True,
+    )
+
+    uploaded_photo = st.file_uploader(
+        "📸 Adicionar ou trocar foto de perfil (aparece no topo do menu)",
+        type=["png", "jpg", "jpeg", "webp"],
+        key="profile_photo_uploader",
+    )
+
+    gender_options = ["Não informado", "Feminino", "Masculino", "Outro"]
+    gender_index = gender_options.index(current_gender) if current_gender in gender_options else 0
+    try:
+        age_int = int(current_age) if str(current_age).strip() else 0
+    except ValueError:
+        age_int = 0
+
+    with st.form("profile_edit_form"):
+        new_display_name = st.text_input(
+            "Nome completo / Como quer ser chamado(a)",
+            value=display_name,
+            max_chars=60,
+        )
+        col_age, col_gender = st.columns(2)
+        with col_age:
+            new_age = st.number_input(
+                "Idade",
+                min_value=0,
+                max_value=120,
+                value=age_int,
+                step=1,
+                help="Deixe 0 se preferir não informar.",
+            )
+        with col_gender:
+            new_gender = st.selectbox(
+                "Sexo",
+                gender_options,
+                index=gender_index,
+            )
+        col_work, col_role = st.columns(2)
+        with col_work:
+            new_workplace = st.text_input(
+                "Local de trabalho / Empresa",
+                value=current_workplace,
+                placeholder="Ex.: Hospital, Comércio, Autônomo...",
+                max_chars=80,
+            )
+        with col_role:
+            new_role = st.text_input(
+                "Cargo / Profissão",
+                value=current_role,
+                placeholder="Ex.: Vendedor, Motorista, Analista...",
+                max_chars=60,
+            )
+        save_profile_btn = st.form_submit_button(
+            "💾 Salvar dados do perfil e foto",
+            use_container_width=True,
+            type="primary",
+        )
+
+    col_remove, col_back = st.columns(2)
+    with col_remove:
+        if photo_url and st.button("🗑️ Remover foto atual", key="btn_remove_photo", use_container_width=True):
+            save_user_profile(db, profile["uid"], {"photo_data_url": ""})
+            st.session_state["saved_message"] = "Foto removida com sucesso."
+            st.rerun()
+    with col_back:
+        if st.button("Voltar ao painel", key="btn_profile_back", use_container_width=True):
+            st.session_state["page"] = "home"
+            st.rerun()
+
+    if save_profile_btn:
+        try:
+            clean_name = new_display_name.strip()
+            if not clean_name:
+                raise ValueError("Informe seu nome de exibição.")
+            updates: dict[str, Any] = {
+                "display_name": clean_name,
+                "age": int(new_age) if new_age > 0 else "",
+                "gender": new_gender,
+                "workplace": new_workplace.strip(),
+                "job_role": new_role.strip(),
+            }
+            if uploaded_photo is not None:
+                updates["photo_data_url"] = process_uploaded_photo(uploaded_photo)
+            save_user_profile(db, profile["uid"], updates)
+            st.session_state["saved_message"] = "Perfil atualizado com sucesso!"
+            st.rerun()
+        except ValueError as error:
+            st.error(str(error))
+        except (GoogleAPICallError, RuntimeError) as error:
+            report_database_error("salvar o perfil", error)
 
 
 def render_transaction_form(
@@ -1082,6 +1406,136 @@ def render_transaction_form(
             report_database_error("salvar o lançamento", error)
 
 
+def generate_free_financial_ai_answer(
+    question: str,
+    records: list[dict[str, Any]],
+    income_cents: int,
+    expense_cents: int,
+    balance_cents: int,
+    category_totals: dict[str, int],
+) -> str:
+    q_lower = question.lower()
+    expenses = [r for r in records if r.get("type") == "despesa"]
+    sorted_categories = sorted(category_totals.items(), key=lambda item: item[1], reverse=True)
+    largest_expense = (
+        max(expenses, key=lambda item: int(item.get("amount_cents", 0)))
+        if expenses
+        else None
+    )
+    committed_pct = (expense_cents / income_cents * 100) if income_cents > 0 else 0.0
+
+    # 1. Perguntas sobre maior gasto
+    if any(term in q_lower for term in ("maior gasto", "maior despesa", "gastei mais", "onde mais gastei", "mais caro")):
+        if not expenses:
+            return "Você ainda não registrou nenhuma despesa neste mês. Seu saldo disponível é de **" + money(balance_cents) + "**."
+        top_cat, top_cat_cents = sorted_categories[0]
+        cat_share = (top_cat_cents / expense_cents * 100) if expense_cents > 0 else 0.0
+        desc = str(largest_expense.get("description", "Despesa")) if largest_expense else "Despesa"
+        val_cents = int(largest_expense.get("amount_cents", 0)) if largest_expense else 0
+        cat_name = str(largest_expense.get("category", "Sem categoria")) if largest_expense else top_cat
+        return (
+            f"📊 **Análise dos seus maiores gastos no mês:**\n\n"
+            f"- **Maior lançamento individual:** `{desc}` ({cat_name}) no valor de **{money(val_cents)}**.\n"
+            f"- **Categoria com maior gasto acumulado:** **{top_cat}**, somando **{money(top_cat_cents)}** "
+            f"({cat_share:.0f}% de todas as suas despesas do mês).\n"
+            f"- **Total de despesas no mês:** **{money(expense_cents)}**."
+        )
+
+    # 2. Perguntas sobre saldo / quanto sobrou / resumo
+    if any(term in q_lower for term in ("saldo", "sobrou", "disponível", "disponivel", "quanto tenho", "situação", "situacao", "resumo")):
+        status_msg = (
+            "Excelente! Você está com saldo positivo e despesas sob controle."
+            if balance_cents > 0 and committed_pct <= 70
+            else "Atenção: seu saldo ainda é positivo, mas boa parte da renda já foi comprometida."
+            if balance_cents > 0
+            else "Alerta: suas despesas atingiram ou superaram a renda recebida até o momento neste mês."
+        )
+        return (
+            f"💰 **Resumo do seu saldo neste mês:**\n\n"
+            f"- **Receitas já recebidas (Salário/Vale):** **{money(income_cents)}**\n"
+            f"- **Total de despesas:** **{money(expense_cents)}** ({committed_pct:.0f}% da renda recebida)\n"
+            f"- **Saldo disponível:** **{money(balance_cents)}**\n\n"
+            f"💡 *{status_msg}*"
+        )
+
+    # 3. Perguntas sobre como economizar / dicas
+    if any(term in q_lower for term in ("economizar", "economia", "dica", "reduzir", "poupar", "guardar", "investir", "planejar")):
+        lines = ["💡 **Plano prático para economizar neste mês:**\n"]
+        if sorted_categories:
+            top_cat, top_cat_cents = sorted_categories[0]
+            saving_15 = int(top_cat_cents * 0.15)
+            lines.append(
+                f"1. **Foque na sua maior categoria ({top_cat} — {money(top_cat_cents)}):** "
+                f"reduzir apenas 15% nos gastos dessa categoria já libera **{money(saving_15)}** no seu orçamento."
+            )
+            if len(sorted_categories) > 1:
+                sec_cat, sec_cents = sorted_categories[1]
+                lines.append(
+                    f"2. **Revise também {sec_cat} ({money(sec_cents)}):** "
+                    f"juntas, as duas maiores categorias representam a maior fatia das suas saídas."
+                )
+        else:
+            lines.append("1. **Registre todos os gastos por categoria:** isso permite identificar onde cortar excessos.")
+
+        if income_cents > 0:
+            ideal_save = int(income_cents * 0.20)
+            lines.append(
+                f"3. **Meta dos 20% (Regra 50-30-20):** com sua renda recebida de **{money(income_cents)}**, "
+                f"uma meta saudável de reserva mensal seria guardar cerca de **{money(ideal_save)}**."
+            )
+        lines.append(
+            f"4. **Saldo atual:** você tem **{money(balance_cents)}** disponíveis. "
+            "Tente definir um limite semanal para gastos variáveis até o fim do mês."
+        )
+        return "\n".join(lines)
+
+    # 4. Perguntas sobre gasto específico (ex.: "Quanto gastei com mercado?")
+    stop_words = {
+        "quanto", "gastei", "gasto", "gastos", "com", "de", "do", "da", "dos", "das",
+        "no", "na", "nos", "nas", "em", "este", "nesse", "mês", "mes", "qual", "foi",
+        "meu", "minha", "total", "para", "por", "que", "como", "valor", "despesa", "despesas",
+    }
+    words = [
+        w.strip("?!.,:;\"'()")
+        for w in q_lower.split()
+        if len(w.strip("?!.,:;\"'()")) >= 3 and w.strip("?!.,:;\"'()") not in stop_words
+    ]
+    if words and expenses:
+        matched_expenses = [
+            r for r in expenses
+            if any(
+                w in str(r.get("category", "")).lower()
+                or w in str(r.get("description", "")).lower()
+                for w in words
+            )
+        ]
+        if matched_expenses:
+            matched_total = sum(int(r.get("amount_cents", 0)) for r in matched_expenses)
+            share = (matched_total / expense_cents * 100) if expense_cents > 0 else 0.0
+            term_label = ", ".join(words)
+            return (
+                f"🔎 **Gastos encontrados para \"{term_label}\":**\n\n"
+                f"- **Total gasto:** **{money(matched_total)}** em **{len(matched_expenses)}** lançamento(s).\n"
+                f"- Isso representa **{share:.0f}%** do total das suas despesas no mês ({money(expense_cents)})."
+            )
+
+    # 5. Resposta geral completa sobre as finanças do mês
+    cat_summary = (
+        ", ".join(f"**{cat}** ({money(val)})" for cat, val in sorted_categories[:4])
+        if sorted_categories
+        else "nenhuma despesa registrada ainda"
+    )
+    return (
+        f"🤖 **Resumo inteligente das suas finanças neste mês:**\n\n"
+        f"- **Renda recebida:** **{money(income_cents)}**\n"
+        f"- **Despesas totais:** **{money(expense_cents)}** ({committed_pct:.0f}% da renda)\n"
+        f"- **Saldo disponível:** **{money(balance_cents)}**\n"
+        f"- **Principais categorias de gasto:** {cat_summary}.\n\n"
+        f"Você pode me perguntar coisas como: *\"Qual foi o meu maior gasto?\"*, "
+        f"*\"Quanto sobrou de saldo?\"*, *\"Como posso economizar?\"* ou *\"Quanto gastei com mercado?\"*."
+    )
+
+
 def answer_financial_ai_question(
     question: str,
     records: list[dict[str, Any]],
@@ -1095,21 +1549,6 @@ def answer_financial_ai_question(
     if len(clean_question) > 1000:
         raise ValueError("A pergunta deve ter no máximo 1.000 caracteres.")
 
-    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
-    try:
-        gemini_config = st.secrets.get("gemini", {})
-    except StreamlitSecretNotFoundError:
-        gemini_config = {}
-    api_key = api_key or str(gemini_config.get("api_key", "")).strip()
-    if not api_key or api_key == "SUA_CHAVE_API":
-        raise RuntimeError(
-            "A IA ainda não está configurada. Defina GEMINI_API_KEY ou adicione "
-            "[gemini].api_key aos Secrets do Streamlit."
-        )
-
-    model = os.environ.get("GEMINI_MODEL", "").strip()
-    model = model or str(gemini_config.get("model", "")).strip() or "gemini-2.5-flash"
-
     category_totals: dict[str, int] = {}
     for record in records:
         if record.get("type") == "despesa":
@@ -1117,6 +1556,29 @@ def answer_financial_ai_question(
             category_totals[category] = (
                 category_totals.get(category, 0) + int(record.get("amount_cents", 0))
             )
+
+    api_key = (
+        str(st.session_state.get("custom_gemini_api_key", "")).strip()
+        or os.environ.get("GEMINI_API_KEY", "").strip()
+    )
+    try:
+        gemini_config = st.secrets.get("gemini", {})
+    except StreamlitSecretNotFoundError:
+        gemini_config = {}
+    api_key = api_key or str(gemini_config.get("api_key", "")).strip()
+
+    if not api_key or api_key == "SUA_CHAVE_API":
+        return generate_free_financial_ai_answer(
+            clean_question,
+            records,
+            income_cents,
+            expense_cents,
+            balance_cents,
+            category_totals,
+        )
+
+    model = os.environ.get("GEMINI_MODEL", "").strip()
+    model = model or str(gemini_config.get("model", "")).strip() or "gemini-2.5-flash"
 
     financial_context = {
         "salario_centavos": income_cents,
@@ -1144,20 +1606,104 @@ def answer_financial_ai_question(
                 temperature=0.4,
             ),
         )
-    except errors.APIError as error:
-        LOGGER.warning("Gemini API request failed: %s", error)
-        raise RuntimeError(
-            "Não foi possível obter uma resposta da IA. Verifique a chave Gemini "
-            "e tente novamente."
-        ) from error
+        answer = response.text
+        if answer and answer.strip():
+            return answer.strip()
+    except Exception as error:
+        LOGGER.warning("Gemini API request failed, using free built-in financial AI: %s", error)
 
-    answer = response.text
-    if not answer or not answer.strip():
-        raise RuntimeError("A IA não retornou uma resposta. Tente reformular a pergunta.")
-    return answer.strip()
+    return generate_free_financial_ai_answer(
+        clean_question,
+        records,
+        income_cents,
+        expense_cents,
+        balance_cents,
+        category_totals,
+    )
 
 
-def render_home(db: firestore.Client, user: dict[str, str]) -> None:
+def render_sidebar(db: Any, user: dict[str, Any]) -> dict[str, Any]:
+    profile = get_user_profile(db, user)
+    display_name = str(profile.get("display_name") or profile.get("username") or "Usuário")
+    photo_url = str(profile.get("photo_data_url") or "")
+    workplace = str(profile.get("workplace") or "")
+    job_role = str(profile.get("job_role") or "")
+    age = str(profile.get("age") or "")
+    gender = str(profile.get("gender") or "")
+
+    avatar_markup = (
+        f'<img src="{photo_url}" class="sidebar-top-photo" alt="Foto">'
+        if photo_url
+        else f'<span class="profile-avatar sidebar-top-avatar">{html.escape(display_name[:1].upper())}</span>'
+    )
+    sub_lines = []
+    if workplace or job_role:
+        work_str = " · ".join(p for p in (job_role, workplace) if p)
+        sub_lines.append(f'<span class="sidebar-profile-meta">🏢 {html.escape(work_str)}</span>')
+    meta_parts = []
+    if age:
+        meta_parts.append(f"{html.escape(age)} anos")
+    if gender and gender != "Não informado":
+        meta_parts.append(html.escape(gender))
+    if meta_parts:
+        sub_lines.append(f'<span class="sidebar-profile-meta">👤 {" · ".join(meta_parts)}</span>')
+    if not sub_lines:
+        sub_lines.append('<span class="sidebar-profile-meta">Conta pessoal · Clique abaixo para editar</span>')
+
+    st.sidebar.markdown(
+        f'<div class="sidebar-brand"><span class="sidebar-brand-mark">✓</span>'
+        f'<span><strong>nuvem</strong><small>FINANÇAS</small></span></div>'
+        f'<div class="sidebar-top-profile">'
+        f'{avatar_markup}'
+        f'<div class="sidebar-top-info">'
+        f'<strong>{html.escape(display_name)}</strong>'
+        f'{"".join(sub_lines)}'
+        f'</div></div>',
+        unsafe_allow_html=True,
+    )
+    if st.sidebar.button("📸  Meu Perfil e Foto", key="sb_profile", use_container_width=True):
+        st.session_state["page"] = "profile"
+        st.rerun()
+
+    st.sidebar.markdown(
+        '<div class="sidebar-section-label">MENU PRINCIPAL</div>',
+        unsafe_allow_html=True,
+    )
+    if st.sidebar.button("▦  Visão geral", key="sb_home", use_container_width=True):
+        st.session_state["page"] = "home"
+        st.session_state["show_gestao"] = False
+        st.session_state["show_reports"] = False
+        st.rerun()
+    if st.sidebar.button("💰  Lançar Salário", key="sb_salary", use_container_width=True):
+        st.session_state["page"] = "salary"
+        st.session_state["income_tab"] = "salary"
+        st.rerun()
+    if st.sidebar.button("💳  Lançar Vale", key="sb_vale", use_container_width=True):
+        st.session_state["page"] = "salary"
+        st.session_state["income_tab"] = "vale"
+        st.rerun()
+    if st.sidebar.button("⚡  Dinheiro Extra / Bico", key="sb_extra", use_container_width=True):
+        st.session_state["page"] = "salary"
+        st.session_state["income_tab"] = "extra"
+        st.rerun()
+    if st.sidebar.button("−  Despesas", key="sb_expense", use_container_width=True):
+        st.session_state["page"] = "create"
+        st.session_state["default_type"] = "despesa"
+        st.rerun()
+    if st.sidebar.button("▤  Lançamentos", key="sb_transactions", use_container_width=True):
+        st.session_state["page"] = "home"
+        st.session_state["show_gestao"] = True
+        st.session_state["show_reports"] = False
+        st.rerun()
+    if st.sidebar.button("▥  Relatórios", key="sb_reports", use_container_width=True):
+        st.session_state["page"] = "home"
+        st.session_state["show_gestao"] = False
+        st.session_state["show_reports"] = True
+        st.rerun()
+    return profile
+
+
+def render_home(db: Any, user: dict[str, Any]) -> None:
     try:
         records = list_transactions(db, user["uid"])
         records, recurring_configs = sync_recurring_income(db, user["uid"], records)
@@ -1177,51 +1723,9 @@ def render_home(db: firestore.Client, user: dict[str, str]) -> None:
         st.session_state["selected_month"] = current_month
 
     display_name = user.get("display_name") or user.get("username")
-
-    st.sidebar.markdown(
-        '<div class="sidebar-brand"><span class="sidebar-brand-mark">✓</span>'
-        '<span><strong>nuvem</strong><small>FINANÇAS</small></span></div>'
-        '<div class="sidebar-section-label">MENU PRINCIPAL</div>',
-        unsafe_allow_html=True,
-    )
-    if st.sidebar.button("▦  Visão geral", key="sb_home", use_container_width=True):
-        st.session_state["page"] = "home"
-        st.session_state["show_gestao"] = False
-        st.session_state["show_reports"] = False
-        st.rerun()
-    if st.sidebar.button("▤  Lançamentos", key="sb_transactions", use_container_width=True):
-        st.session_state["page"] = "home"
-        st.session_state["show_gestao"] = True
-        st.session_state["show_reports"] = False
-        st.rerun()
-    if st.sidebar.button("▥  Relatórios", key="sb_reports", use_container_width=True):
-        st.session_state["page"] = "home"
-        st.session_state["show_gestao"] = False
-        st.session_state["show_reports"] = True
-        st.rerun()
-    if st.sidebar.button("＋  Lançar Salário", key="sb_salary", use_container_width=True):
-        st.session_state["page"] = "salary"
-        st.session_state["income_tab"] = "salary"
-        st.rerun()
-    if st.sidebar.button("＋  Lançar Vale", key="sb_vale", use_container_width=True):
-        st.session_state["page"] = "salary"
-        st.session_state["income_tab"] = "vale"
-        st.rerun()
-    if st.sidebar.button("−  Despesas", key="sb_expense", use_container_width=True):
-        st.session_state["page"] = "create"
-        st.session_state["default_type"] = "despesa"
-        st.rerun()
-    st.sidebar.markdown(
-        '<div class="sidebar-section-label sidebar-preferences">SUA CONTA</div>',
-        unsafe_allow_html=True,
-    )
-    st.sidebar.markdown(
-        f'<div class="sidebar-profile"><span class="profile-avatar">'
-        f'{html.escape(str(display_name)[:1].upper())}</span>'
-        f'<span><strong>{html.escape(str(display_name))}</strong>'
-        '<small>Conta pessoal</small></span></div>',
-        unsafe_allow_html=True,
-    )
+    workplace = str(user.get("workplace") or "")
+    job_role = str(user.get("job_role") or "")
+    photo_url = str(user.get("photo_data_url") or "")
 
     if st.session_state.get("saved_message"):
         st.success(st.session_state.pop("saved_message"))
@@ -1229,12 +1733,22 @@ def render_home(db: firestore.Client, user: dict[str, str]) -> None:
     today = date.today()
     weekday_names = ("segunda-feira", "terça-feira", "quarta-feira", "quinta-feira", "sexta-feira", "sábado", "domingo")
     date_text = f"{weekday_names[today.weekday()].capitalize()}, {today.day:02d} de {month_label(today.strftime('%Y-%m')).split(' de ')[0].lower()} de {today.year}"
+    work_badge = (
+        f'<span class="welcome-work-pill">🏢 {html.escape(" · ".join(p for p in (job_role, workplace) if p))}</span>'
+        if (workplace or job_role)
+        else ""
+    )
+    header_avatar = (
+        f'<img src="{photo_url}" class="welcome-avatar-img" alt="Foto">'
+        if photo_url
+        else ""
+    )
     header_col, month_col = st.columns([3, 1.2], vertical_alignment="center")
     with header_col:
         st.markdown(
-            f'<div class="welcome-header"><div class="welcome-date">{html.escape(date_text)}</div>'
-            f'<h1>Olá, {html.escape(str(display_name))} 👋</h1>'
-            '<p>Veja como estão suas finanças neste mês.</p></div>',
+            f'<div class="welcome-header"><div class="welcome-date">{html.escape(date_text)} {work_badge}</div>'
+            f'<div class="welcome-title-row">{header_avatar}<h1>Olá, {html.escape(str(display_name))} 👋</h1></div>'
+            '<p>Acompanhe seu salário, vale, ganhos extras e despesas do mês.</p></div>',
             unsafe_allow_html=True,
         )
     with month_col:
@@ -1248,11 +1762,17 @@ def render_home(db: firestore.Client, user: dict[str, str]) -> None:
     displayed_records = [item for item in records if item["date"].startswith(selected_month)]
     period_label = month_label(selected_month)
     today_iso = today.isoformat()
-    income_total = sum(
-        item["amount_cents"]
+    received_incomes = [
+        item
         for item in displayed_records
         if item["type"] == "receita" and str(item.get("date", "")) <= today_iso
+    ]
+    extra_incomes = [item for item in received_incomes if is_extra_income_record(item)]
+    salary_vale_total = sum(
+        item["amount_cents"] for item in received_incomes if not is_extra_income_record(item)
     )
+    extra_total = sum(item["amount_cents"] for item in extra_incomes)
+    income_total = salary_vale_total + extra_total
     expense_total = sum(
         item["amount_cents"] for item in displayed_records if item["type"] == "despesa"
     )
@@ -1266,7 +1786,7 @@ def render_home(db: firestore.Client, user: dict[str, str]) -> None:
             pay_day = int(cfg.get("day", 1))
             sched_date = clamp_day_to_month(sel_year, sel_m, pay_day)
             if sched_date <= today:
-                recurring_notes.append(f"✓ {label_name} recebido (dia {pay_day:02d})")
+                recurring_notes.append(f"✓ {label_name} (dia {pay_day:02d})")
             else:
                 recurring_notes.append(
                     f"⏳ {label_name} ({money(int(cfg['amount_cents']))}) soma dia {pay_day:02d}"
@@ -1276,18 +1796,26 @@ def render_home(db: firestore.Client, user: dict[str, str]) -> None:
         if recurring_notes
         else f"✓ &nbsp; Recebido em {html.escape(period_label)}"
     )
+    extra_note_text = (
+        f"⚡ {len(extra_incomes)} ganho(s) extra / bico(s) no mês"
+        if extra_incomes
+        else "Adicione bicos ou rendas extras"
+    )
     st.markdown(
-        f'<div class="metrics-row">'
+        f'<div class="metrics-row metrics-row-4">'
         f'<div class="metric-card metric-income"><div class="metric-label">Salário e Vale recebidos</div>'
-        f'<div class="metric-val">{money(income_total)}</div>'
+        f'<div class="metric-val">{money(salary_vale_total)}</div>'
         f'<div class="metric-note">{income_note_text}</div></div>'
+        f'<div class="metric-card metric-extra"><div class="metric-label">Dinheiro Extra / Bicos</div>'
+        f'<div class="metric-val">{money(extra_total)}</div>'
+        f'<div class="metric-note">{extra_note_text}</div></div>'
         f'<div class="metric-card metric-expense"><div class="metric-label">Despesas do mês</div>'
         f'<div class="metric-val">{money(expense_total)}</div>'
-        f'<div class="metric-note">{committed_share:.0%} do salário utilizado</div>'
+        f'<div class="metric-note">{committed_share:.0%} da renda utilizada</div>'
         f'<div class="metric-progress"><span style="width:{committed_share:.0%}"></span></div></div>'
         f'<div class="metric-card metric-balance"><div class="metric-label">Saldo disponível</div>'
         f'<div class="metric-val">{money(balance)}</div>'
-        f'<div class="metric-note">Disponível para seus planos</div></div>'
+        f'<div class="metric-note">Total (Salário + Vale + Bicos − Gastos)</div></div>'
         f'</div>',
         unsafe_allow_html=True,
     )
@@ -1364,23 +1892,30 @@ def render_home(db: firestore.Client, user: dict[str, str]) -> None:
             '<p>O que você deseja fazer?</p></div></div>',
             unsafe_allow_html=True,
         )
-        if st.button("＋  Lançar salário", key="quick_add_salary", use_container_width=True):
+        if st.button("💰  Lançar salário", key="quick_add_salary", use_container_width=True):
             st.session_state["page"] = "salary"
             st.session_state["income_tab"] = "salary"
             st.rerun()
-        if st.button("＋  Lançar vale", key="quick_add_vale", use_container_width=True):
+        if st.button("💳  Lançar vale", key="quick_add_vale", use_container_width=True):
             st.session_state["page"] = "salary"
             st.session_state["income_tab"] = "vale"
+            st.rerun()
+        if st.button("⚡  Adicionar bico / extra", key="quick_add_extra", use_container_width=True):
+            st.session_state["page"] = "salary"
+            st.session_state["income_tab"] = "extra"
             st.rerun()
         if st.button("−  Adicionar gasto", key="quick_add_expense", use_container_width=True):
             st.session_state["page"] = "create"
             st.session_state["default_type"] = "despesa"
             st.rerun()
+        if st.button("📸  Meu perfil e foto", key="quick_open_profile", use_container_width=True):
+            st.session_state["page"] = "profile"
+            st.rerun()
         st.markdown(
             f'<div class="commitment-card"><div class="commitment-title">Renda comprometida'
             f'<strong>{committed_share:.0%}</strong></div>'
             f'<div class="metric-progress"><span style="width:{committed_share:.0%}"></span></div>'
-            f'<small>{money(expense_total)} de {money(income_total)} do salário</small></div>',
+            f'<small>{money(expense_total)} de {money(income_total)} recebidos no mês</small></div>',
             unsafe_allow_html=True,
         )
 
@@ -1689,7 +2224,7 @@ def main() -> None:
             display: flex;
             align-items: center;
             gap: 12px;
-            margin: 0.5rem 0 2rem;
+            margin: 0.2rem 0 1.1rem;
         }
         .sidebar-brand-mark {
             display: grid;
@@ -1697,31 +2232,100 @@ def main() -> None:
             height: 42px;
             place-items: center;
             border-radius: 14px;
-            background: #173a32;
-            color: #55e0b0 !important;
-            font-size: 1.4rem;
+            background: linear-gradient(135deg, #064e3b 0%, #10b981 100%);
+            color: #ffffff !important;
+            font-size: 1.35rem;
             font-weight: 800;
+            box-shadow: 0 6px 16px rgba(16, 185, 129, 0.25);
         }
         .sidebar-brand strong, .sidebar-brand small,
         .sidebar-profile strong, .sidebar-profile small {
             display: block;
         }
         .sidebar-brand strong {
-            color: #173a32 !important;
-            font-size: 1.1rem;
+            color: #0f172a !important;
+            font-size: 1.12rem;
+            font-weight: 800;
             line-height: 1.15;
         }
         .sidebar-brand small {
             margin-top: 3px;
-            color: #84918e !important;
-            font-size: 0.58rem;
+            color: #059669 !important;
+            font-size: 0.6rem;
+            font-weight: 800;
             letter-spacing: 0.16em;
         }
+        .sidebar-top-profile {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            padding: 0.85rem 0.9rem;
+            margin: 0 0 0.55rem;
+            border-radius: 18px;
+            background: linear-gradient(135deg, #0f2922 0%, #173a32 60%, #1e4d41 100%);
+            border: 1px solid rgba(52, 211, 153, 0.28);
+            box-shadow: 0 10px 24px rgba(15, 41, 34, 0.16);
+        }
+        .sidebar-top-photo {
+            width: 54px;
+            height: 54px;
+            flex: 0 0 54px;
+            border-radius: 50%;
+            object-fit: cover;
+            border: 2.5px solid #34d399;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25);
+        }
+        .sidebar-top-avatar {
+            width: 54px !important;
+            height: 54px !important;
+            flex: 0 0 54px !important;
+            font-size: 1.25rem !important;
+            font-weight: 800 !important;
+            background: linear-gradient(135deg, #10b981, #059669) !important;
+            color: #ffffff !important;
+            border: 2px solid rgba(255, 255, 255, 0.35);
+        }
+        .sidebar-top-info {
+            min-width: 0;
+            flex: 1;
+        }
+        .sidebar-top-info strong {
+            display: block;
+            color: #ffffff !important;
+            font-size: 0.92rem;
+            font-weight: 800;
+            line-height: 1.2;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .sidebar-profile-meta {
+            display: block;
+            margin-top: 3px;
+            color: #a7f3d0 !important;
+            font-size: 0.7rem;
+            font-weight: 500;
+            line-height: 1.25;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .st-key-sb_profile button {
+            background: #ecfdf5 !important;
+            border: 1px solid #a7f3d0 !important;
+            color: #065f46 !important;
+            font-weight: 700 !important;
+            margin-bottom: 0.4rem !important;
+        }
+        .st-key-sb_profile button:hover {
+            background: #d1fae5 !important;
+            border-color: #10b981 !important;
+        }
         .sidebar-section-label {
-            margin: 0.6rem 0 0.5rem 0.5rem;
-            color: #84918e !important;
+            margin: 0.75rem 0 0.45rem 0.5rem;
+            color: #64748b !important;
             font-size: 0.65rem;
-            font-weight: 750;
+            font-weight: 800;
             letter-spacing: 0.12em;
         }
         .sidebar-preferences {
@@ -1758,18 +2362,146 @@ def main() -> None:
             font-size: 0.68rem;
         }
         .welcome-header { padding: 0.15rem 0 1rem; }
-        .welcome-date { color: #84918e; font-size: 0.76rem; }
-        .welcome-header h1 {
+        .welcome-date {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            gap: 8px;
+            color: #64748b;
+            font-size: 0.78rem;
+            font-weight: 500;
+        }
+        .welcome-work-pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            padding: 2px 10px;
+            border-radius: 99px;
+            background: #ecfdf5;
+            border: 1px solid #a7f3d0;
+            color: #065f46;
+            font-size: 0.72rem;
+            font-weight: 700;
+        }
+        .welcome-title-row {
+            display: flex;
+            align-items: center;
+            gap: 12px;
             margin: 0.45rem 0 0.3rem;
-            color: #172522;
-            font-size: clamp(1.55rem, 2.4vw, 2rem);
-            font-weight: 750;
+        }
+        .welcome-avatar-img {
+            width: 46px;
+            height: 46px;
+            border-radius: 50%;
+            object-fit: cover;
+            border: 2px solid #10b981;
+            box-shadow: 0 4px 12px rgba(16, 185, 129, 0.2);
+        }
+        .welcome-header h1 {
+            margin: 0;
+            color: #0f172a;
+            font-size: clamp(1.55rem, 2.4vw, 2.05rem);
+            font-weight: 800;
             letter-spacing: -0.04em;
         }
         .welcome-header p, .section-heading p {
             margin: 0;
-            color: #84918e;
-            font-size: 0.82rem;
+            color: #64748b;
+            font-size: 0.84rem;
+        }
+        /* ── Profile Hero Card ── */
+        .profile-hero-card {
+            display: flex;
+            align-items: center;
+            gap: 20px;
+            max-width: 720px;
+            margin: 0.5rem auto 1.25rem;
+            padding: 1.5rem 1.75rem;
+            border-radius: 22px;
+            background: linear-gradient(135deg, #0f2922 0%, #173a32 55%, #065f46 100%);
+            color: #ffffff;
+            box-shadow: 0 16px 36px rgba(15, 41, 34, 0.18);
+        }
+        .profile-page-photo {
+            width: 92px;
+            height: 92px;
+            flex: 0 0 92px;
+            border-radius: 50%;
+            object-fit: cover;
+            border: 3px solid #34d399;
+            box-shadow: 0 8px 20px rgba(0, 0, 0, 0.28);
+        }
+        .profile-page-avatar {
+            display: grid;
+            place-items: center;
+            width: 92px;
+            height: 92px;
+            flex: 0 0 92px;
+            border-radius: 50%;
+            background: linear-gradient(135deg, #10b981, #059669);
+            color: #ffffff;
+            font-size: 2.2rem;
+            font-weight: 800;
+            border: 3px solid rgba(255, 255, 255, 0.35);
+        }
+        .profile-hero-info h2 {
+            margin: 0;
+            color: #ffffff !important;
+            font-size: 1.45rem;
+            font-weight: 800;
+        }
+        .profile-hero-info p {
+            margin: 0.2rem 0 0.65rem;
+            color: #a7f3d0;
+            font-size: 0.85rem;
+        }
+        .profile-badges-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+        .profile-badge {
+            display: inline-flex;
+            align-items: center;
+            padding: 4px 11px;
+            border-radius: 99px;
+            background: rgba(255, 255, 255, 0.14);
+            border: 1px solid rgba(255, 255, 255, 0.22);
+            color: #ecfdf5;
+            font-size: 0.75rem;
+            font-weight: 600;
+        }
+        /* ── Extra Income Banner & List ── */
+        .extra-banner {
+            background: linear-gradient(135deg, #fffbeb 0%, #fef3c7 100%) !important;
+            border: 1px solid #fde68a !important;
+            color: #78350f !important;
+        }
+        .extra-banner-icon {
+            background: #d97706 !important;
+            color: #ffffff !important;
+        }
+        .extra-item-row {
+            padding: 0.55rem 0.85rem;
+            margin-bottom: 0.35rem;
+            border-radius: 12px;
+            background: #ffffff;
+            border: 1px solid #e2e8f0;
+        }
+        .extra-item-row strong {
+            display: block;
+            color: #0f172a;
+            font-size: 0.86rem;
+        }
+        .extra-item-row small {
+            color: #64748b;
+            font-size: 0.74rem;
+        }
+        .extra-item-val {
+            text-align: right;
+            font-weight: 800;
+            color: #d97706;
+            font-size: 0.92rem;
         }
         .section-heading {
             display: flex;
@@ -2067,15 +2799,18 @@ def main() -> None:
             margin: 0.7rem 0 1rem;
             width: 100%;
         }
+        .metrics-row-4 {
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+        }
         .metric-card {
             flex: 1;
             min-width: 0;
             background: #ffffff;
-            border: 1px solid rgba(0, 0, 0, 0.05);
-            border-radius: 18px;
-            padding: 21px 22px;
+            border: 1px solid rgba(15, 23, 42, 0.06);
+            border-radius: 20px;
+            padding: 20px 21px;
             text-align: left;
-            box-shadow: 0 6px 18px rgba(15,23,42,0.045), 0 1px 3px rgba(15,23,42,0.02);
+            box-shadow: 0 8px 22px rgba(15,23,42,0.05), 0 1px 3px rgba(15,23,42,0.02);
             transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
             position: relative;
             overflow: hidden;
@@ -2086,14 +2821,15 @@ def main() -> None:
             top: 0;
             left: 0;
             right: 0;
-            height: 3px;
+            height: 4px;
         }
-        .metric-income::before { background: linear-gradient(90deg, #059669, #34d399); }
-        .metric-expense::before { background: linear-gradient(90deg, #dc2626, #f87171); }
+        .metric-income::before { background: linear-gradient(90deg, #10b981, #34d399); }
+        .metric-extra::before { background: linear-gradient(90deg, #f59e0b, #fbbf24); }
+        .metric-expense::before { background: linear-gradient(90deg, #ef4444, #f87171); }
         .metric-balance::before { background: linear-gradient(90deg, #0284c7, #38bdf8); }
         .metric-card:hover {
             transform: translateY(-3px);
-            box-shadow: 0 12px 28px rgba(0, 0, 0, 0.08);
+            box-shadow: 0 14px 30px rgba(15, 23, 42, 0.09);
         }
         .metric-label {
             font-size: 0.78rem;
@@ -2104,23 +2840,30 @@ def main() -> None:
             letter-spacing: 0;
         }
         .metric-val {
-            margin: 0.7rem 0;
-            font-size: clamp(1.25rem, 2.5vw, 1.75rem);
-            font-weight: 750;
-            letter-spacing: -0.02em;
+            margin: 0.65rem 0;
+            font-size: clamp(1.2rem, 2.2vw, 1.65rem);
+            font-weight: 800;
+            letter-spacing: -0.025em;
+            white-space: nowrap;
         }
         .metric-income {
-            background: linear-gradient(135deg, #173a32 0%, #0d1e1c 100%);
+            background: linear-gradient(135deg, #0f2922 0%, #173a32 60%, #065f46 100%);
             border-color: #173a32;
         }
-        .metric-income .metric-label, .metric-income .metric-note { color: #b8cbc4; }
+        .metric-income .metric-label { color: #a7f3d0; }
         .metric-income .metric-val { color: #ffffff; }
+        .metric-income .metric-note { color: #6ee7b7; }
+        .metric-extra {
+            background: linear-gradient(135deg, #fffbeb 0%, #fef3c7 100%);
+            border-color: #fde68a;
+        }
+        .metric-extra .metric-label { color: #92400e; }
+        .metric-extra .metric-val { color: #b45309; }
+        .metric-extra .metric-note { color: #b45309; font-weight: 600; }
         .metric-expense .metric-val { color: #172522; }
-        .metric-balance .metric-val { color: #172522; }
-        .metric-note { color: #84918e; font-size: 0.72rem; }
-        .metric-income .metric-note { color: #82e7c3; }
+        .metric-balance .metric-val { color: #0f172a; }
+        .metric-note { color: #64748b; font-size: 0.72rem; }
         .metric-expense .metric-progress { margin-top: 0.75rem; }
-        .metric-val { white-space: nowrap; }
 
         /* ── Logout Button ── */
         .st-key-logout_button {
@@ -2394,11 +3137,15 @@ def main() -> None:
         render_authentication(db)
         return
 
+    user = render_sidebar(db, user)
+
     page = st.session_state.get("page", "home")
     if page == "create":
         render_transaction_form(db, user)
     elif page == "salary":
         render_transaction_form(db, user, salary_entry=True)
+    elif page == "profile":
+        render_profile_page(db, user)
     elif page == "edit":
         transaction = st.session_state.get("editing_transaction")
         if transaction is None:
