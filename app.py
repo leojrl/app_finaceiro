@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import calendar
 import hashlib
 import html
 import importlib
@@ -108,7 +109,197 @@ def parse_amount(value: str) -> int:
     return cents
 
 
-def get_firestore_client() -> firestore.Client:
+class LocalDocumentSnapshot:
+    def __init__(self, doc_id: str, data: dict[str, Any] | None) -> None:
+        self.id = doc_id
+        self._data = dict(data) if data is not None else None
+        self.exists = data is not None
+
+    def to_dict(self) -> dict[str, Any] | None:
+        return dict(self._data) if self._data is not None else None
+
+    def get(self, field: str) -> Any:
+        if self._data is None:
+            return None
+        return self._data.get(field)
+
+
+class LocalDocumentReference:
+    def __init__(self, client: LocalFirestoreClient, collection_name: str, doc_id: str) -> None:
+        self._client = client
+        self._collection_name = collection_name
+        self.id = doc_id
+
+    def get(self, transaction: Any = None) -> LocalDocumentSnapshot:
+        del transaction
+        col = self._client._read_collection(self._collection_name)
+        raw = col.get(self.id)
+        return LocalDocumentSnapshot(self.id, raw)
+
+    def create(self, data: dict[str, Any]) -> None:
+        self._client._write_doc(self._collection_name, self.id, data, mode="create")
+
+    def set(self, data: dict[str, Any], merge: bool = False) -> None:
+        self._client._write_doc(
+            self._collection_name,
+            self.id,
+            data,
+            mode="merge" if merge else "set",
+        )
+
+    def update(self, data: dict[str, Any]) -> None:
+        self._client._write_doc(self._collection_name, self.id, data, mode="update")
+
+    def delete(self) -> None:
+        self._client._delete_doc(self._collection_name, self.id)
+
+
+class LocalQuery:
+    def __init__(
+        self,
+        client: LocalFirestoreClient,
+        collection_name: str,
+        filters: list[tuple[str, str, Any]],
+    ) -> None:
+        self._client = client
+        self._collection_name = collection_name
+        self._filters = filters
+
+    def where(self, field: str, op: str, value: Any) -> LocalQuery:
+        return LocalQuery(
+            self._client,
+            self._collection_name,
+            [*self._filters, (field, op, value)],
+        )
+
+    def stream(self) -> list[LocalDocumentSnapshot]:
+        col = self._client._read_collection(self._collection_name)
+        results: list[LocalDocumentSnapshot] = []
+        for doc_id, doc_data in col.items():
+            matched = True
+            for field, op, value in self._filters:
+                if op == "==" and doc_data.get(field) != value:
+                    matched = False
+                    break
+            if matched:
+                results.append(LocalDocumentSnapshot(doc_id, doc_data))
+        return results
+
+
+class LocalCollectionReference:
+    def __init__(self, client: LocalFirestoreClient, name: str) -> None:
+        self._client = client
+        self._name = name
+
+    def document(self, doc_id: str | None = None) -> LocalDocumentReference:
+        actual_id = doc_id if doc_id else secrets.token_urlsafe(16)
+        return LocalDocumentReference(self._client, self._name, actual_id)
+
+    def where(self, field: str, op: str, value: Any) -> LocalQuery:
+        return LocalQuery(self._client, self._name, [(field, op, value)])
+
+    def stream(self) -> list[LocalDocumentSnapshot]:
+        return LocalQuery(self._client, self._name, []).stream()
+
+
+class LocalTransaction:
+    def create(self, doc_ref: LocalDocumentReference, data: dict[str, Any]) -> None:
+        doc_ref.create(data)
+
+    def update(self, doc_ref: LocalDocumentReference, data: dict[str, Any]) -> None:
+        doc_ref.update(data)
+
+    def set(self, doc_ref: LocalDocumentReference, data: dict[str, Any], merge: bool = False) -> None:
+        doc_ref.set(data, merge=merge)
+
+    def delete(self, doc_ref: LocalDocumentReference) -> None:
+        doc_ref.delete()
+
+
+def _serialize_json_value(value: Any) -> Any:
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {str(k): _serialize_json_value(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_serialize_json_value(v) for v in value]
+    return value
+
+
+class LocalFirestoreClient:
+    def __init__(self, file_path: Path) -> None:
+        self._file_path = file_path
+
+    def _load_all(self) -> dict[str, dict[str, dict[str, Any]]]:
+        if not self._file_path.is_file():
+            return {}
+        try:
+            content = self._file_path.read_text(encoding="utf-8")
+            parsed = json.loads(content)
+            return parsed if isinstance(parsed, dict) else {}
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    def _save_all(self, store: dict[str, dict[str, dict[str, Any]]]) -> None:
+        serialized = _serialize_json_value(store)
+        self._file_path.write_text(
+            json.dumps(serialized, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    def _read_collection(self, name: str) -> dict[str, dict[str, Any]]:
+        store = self._load_all()
+        col = store.get(name)
+        return dict(col) if isinstance(col, dict) else {}
+
+    def _write_doc(
+        self,
+        collection_name: str,
+        doc_id: str,
+        data: dict[str, Any],
+        mode: str = "set",
+    ) -> None:
+        store = self._load_all()
+        col = store.setdefault(collection_name, {})
+        serialized_data = _serialize_json_value(data)
+        if mode == "create":
+            col[doc_id] = dict(serialized_data)
+        elif mode == "merge" and doc_id in col and isinstance(col[doc_id], dict):
+            merged = dict(col[doc_id])
+            merged.update(serialized_data)
+            col[doc_id] = merged
+        elif mode == "update":
+            if doc_id not in col:
+                raise PermissionError("Lançamento não encontrado.")
+            updated = dict(col[doc_id])
+            updated.update(serialized_data)
+            col[doc_id] = updated
+        else:
+            col[doc_id] = dict(serialized_data)
+        self._save_all(store)
+
+    def _delete_doc(self, collection_name: str, doc_id: str) -> None:
+        store = self._load_all()
+        col = store.get(collection_name)
+        if isinstance(col, dict) and doc_id in col:
+            del col[doc_id]
+            self._save_all(store)
+
+    def collection(self, name: str) -> LocalCollectionReference:
+        return LocalCollectionReference(self, name)
+
+    def transaction(self) -> LocalTransaction:
+        return LocalTransaction()
+
+
+def run_in_transaction(db: Any, func: Any) -> Any:
+    if isinstance(db, LocalFirestoreClient):
+        return func(db.transaction())
+    return firestore.transactional(func)(db.transaction())
+
+
+def get_firestore_client() -> Any:
+    app_directory = Path(__file__).resolve().parent
     credentials_path = os.environ.get("FIREBASE_CREDENTIALS")
     try:
         firebase_config = st.secrets.get("firebase")
@@ -117,44 +308,25 @@ def get_firestore_client() -> firestore.Client:
     if credentials_path:
         credential_file = Path(credentials_path).expanduser()
         if not credential_file.is_file():
-            raise RuntimeError(
-                f"O arquivo de credenciais informado não existe: {credential_file}"
-            )
+            return LocalFirestoreClient(app_directory / "dados_financeiros.json")
         firebase_credential = credentials.Certificate(str(credential_file))
     elif firebase_config:
         config_dict = dict(firebase_config)
         pk = str(config_dict.get("private_key", ""))
         if "COLE_AQUI" in pk or "ID_DO_PROJETO" in str(config_dict.get("project_id", "")):
-            raise RuntimeError(
-                "As credenciais do Firebase nos Secrets contêm o texto de exemplo "
-                "('COLE_AQUI_A_CHAVE_PRIVADA_COMPLETA' ou 'ID_DO_PROJETO'). "
-                "Substitua os Secrets pelo conteúdo configurado em .streamlit/secrets.toml."
-            )
+            return LocalFirestoreClient(app_directory / "dados_financeiros.json")
         try:
             firebase_credential = credentials.Certificate(config_dict)
-        except Exception as err:
-            raise RuntimeError(
-                f"Erro ao carregar a chave privada do Firebase nos Secrets: {err}. "
-                "Verifique se o bloco 'private_key' foi copiado com as quebras de linha e delimitadores corretos."
-            ) from err
+        except Exception:
+            return LocalFirestoreClient(app_directory / "dados_financeiros.json")
     else:
-        app_directory = Path(__file__).resolve().parent
         candidates = list(app_directory.glob("*firebase-adminsdk*.json"))
         standard_path = app_directory / "serviceAccountKey.json"
-        if standard_path.is_file():
+        if standard_path.is_file() and standard_path not in candidates:
             candidates.append(standard_path)
 
-        if len(candidates) > 1:
-            raise RuntimeError(
-                "Foram encontrados vários arquivos JSON de conta de serviço. "
-                "Defina FIREBASE_CREDENTIALS com o caminho do arquivo correto."
-            )
         if not candidates:
-            raise RuntimeError(
-                "Não encontrei um JSON de conta de serviço ao lado de app.py. "
-                "Coloque o arquivo Firebase nessa pasta ou configure FIREBASE_CREDENTIALS "
-                "com o caminho completo do JSON."
-            )
+            return LocalFirestoreClient(app_directory / "dados_financeiros.json")
         credential_file = candidates[0]
         firebase_credential = credentials.Certificate(str(credential_file))
 
@@ -166,14 +338,12 @@ def get_firestore_client() -> firestore.Client:
 
 
 def register_user(
-    db: firestore.Client, username: str, password_hash: str, display_name: str
+    db: Any, username: str, password_hash: str, display_name: str
 ) -> bool:
     uid = secrets.token_urlsafe(24)
     username_ref = db.collection("usernames").document(username)
     user_ref = db.collection("users").document(uid)
-    transaction = db.transaction()
 
-    @firestore.transactional
     def create_account(transaction: Any) -> bool:
         username_snapshot = username_ref.get(transaction=transaction)
         if username_snapshot.exists:
@@ -194,7 +364,7 @@ def register_user(
         )
         return True
 
-    return create_account(transaction)
+    return bool(run_in_transaction(db, create_account))
 
 
 def authenticate_user(db: firestore.Client, username: str, password: str) -> dict[str, str] | None:
@@ -228,17 +398,21 @@ def authenticate_user(db: firestore.Client, username: str, password: str) -> dic
     return {"uid": uid, "username": stored_username, "display_name": display_name}
 
 
-def list_transactions(db: firestore.Client, uid: str) -> list[dict[str, Any]]:
+def list_transactions(db: Any, uid: str) -> list[dict[str, Any]]:
     records = []
     for snapshot in db.collection("transactions").where("owner_uid", "==", uid).stream():
-        record = snapshot.to_dict()
+        record = snapshot.to_dict() or {}
         record["id"] = snapshot.id
         records.append(record)
-    return sorted(records, key=lambda item: (item["date"], item["created_at"]), reverse=True)
+    return sorted(
+        records,
+        key=lambda item: (str(item.get("date", "")), str(item.get("created_at", ""))),
+        reverse=True,
+    )
 
 
 def save_transaction(
-    db: firestore.Client,
+    db: Any,
     uid: str,
     transaction_id: str | None,
     transaction_data: dict[str, Any],
@@ -251,30 +425,261 @@ def save_transaction(
         return
 
     transaction_ref = collection.document(transaction_id)
-    transaction = db.transaction()
 
-    @firestore.transactional
     def update_owned_transaction(transaction: Any) -> None:
         snapshot = transaction_ref.get(transaction=transaction)
         if not snapshot.exists or snapshot.get("owner_uid") != uid:
             raise PermissionError("Lançamento não encontrado para este usuário.")
         transaction.update(transaction_ref, transaction_data)
 
-    update_owned_transaction(transaction)
+    run_in_transaction(db, update_owned_transaction)
 
 
-def delete_transaction(db: firestore.Client, uid: str, transaction_id: str) -> None:
+def clamp_day_to_month(year: int, month: int, day: int) -> date:
+    last_day = calendar.monthrange(year, month)[1]
+    return date(year, month, max(1, min(day, last_day)))
+
+
+def iter_months(start_month: str, end_month: str) -> list[str]:
+    try:
+        start_year, start_m = map(int, start_month.split("-"))
+        end_year, end_m = map(int, end_month.split("-"))
+    except ValueError:
+        return [end_month]
+    months: list[str] = []
+    year, month = start_year, start_m
+    while (year, month) <= (end_year, end_m) and len(months) < 120:
+        months.append(f"{year:04d}-{month:02d}")
+        if month == 12:
+            year += 1
+            month = 1
+        else:
+            month += 1
+    return months
+
+
+def infer_recurring_kind(record: dict[str, Any]) -> str | None:
+    explicit_kind = record.get("recurring_kind")
+    if explicit_kind in ("salary", "vale"):
+        return str(explicit_kind)
+    if record.get("type") != "receita":
+        return None
+    category = str(record.get("category", "")).strip().lower()
+    description = str(record.get("description", "")).strip().lower()
+    if "vale" in category or "vale" in description or "adiantamento" in category:
+        return "vale"
+    if category in ("salário", "salario") or description in ("salário", "salario"):
+        return "salary"
+    return None
+
+
+def get_recurring_configs(db: firestore.Client, uid: str) -> dict[str, dict[str, Any]]:
+    snapshot = db.collection("users").document(uid).get()
+    if not snapshot.exists:
+        return {}
+    data = snapshot.to_dict() or {}
+    configs: dict[str, dict[str, Any]] = {}
+    for kind, field in (("salary", "salary_config"), ("vale", "vale_config")):
+        raw = data.get(field)
+        if isinstance(raw, dict) and raw.get("active", True) and int(raw.get("amount_cents", 0)) > 0:
+            configs[kind] = raw
+    return configs
+
+
+def save_recurring_income(
+    db: firestore.Client,
+    uid: str,
+    kind: str,
+    description: str,
+    amount_cents: int,
+    category: str,
+    transaction_date: date,
+) -> None:
+    field = "salary_config" if kind == "salary" else "vale_config"
+    month_key = transaction_date.strftime("%Y-%m")
+    pay_day = transaction_date.day
+
+    user_ref = db.collection("users").document(uid)
+    user_snap = user_ref.get()
+    existing_cfg = (user_snap.to_dict() or {}).get(field) if user_snap.exists else None
+    if not isinstance(existing_cfg, dict):
+        existing_cfg = {}
+    existing_start = str(existing_cfg.get("start_month") or month_key)
+    start_month = min(existing_start, month_key)
+    deleted_months = [m for m in (existing_cfg.get("deleted_months") or []) if m != month_key]
+
+    config_payload = {
+        "amount_cents": amount_cents,
+        "day": pay_day,
+        "description": description,
+        "category": category,
+        "start_month": start_month,
+        "last_saved_date": transaction_date.isoformat(),
+        "deleted_months": deleted_months,
+        "active": True,
+        "updated_at": datetime.now(timezone.utc),
+    }
+    user_ref.set({field: config_payload}, merge=True)
+
+    records = list_transactions(db, uid)
+    existing_record = next(
+        (
+            item
+            for item in records
+            if str(item.get("date", "")).startswith(month_key)
+            and infer_recurring_kind(item) == kind
+        ),
+        None,
+    )
+    transaction_data = {
+        "type": "receita",
+        "description": description,
+        "amount_cents": amount_cents,
+        "category": category,
+        "date": transaction_date.isoformat(),
+        "recurring_kind": kind,
+        "recurring_month": month_key,
+        "recurring_day": pay_day,
+    }
+    save_transaction(
+        db,
+        uid,
+        existing_record["id"] if existing_record is not None else None,
+        transaction_data,
+    )
+
+
+def disable_recurring_income(db: firestore.Client, uid: str, kind: str) -> None:
+    field = "salary_config" if kind == "salary" else "vale_config"
+    user_ref = db.collection("users").document(uid)
+    user_snap = user_ref.get()
+    existing_cfg = (user_snap.to_dict() or {}).get(field) if user_snap.exists else None
+    if isinstance(existing_cfg, dict):
+        existing_cfg = dict(existing_cfg)
+        existing_cfg["active"] = False
+        existing_cfg["updated_at"] = datetime.now(timezone.utc)
+        user_ref.set({field: existing_cfg}, merge=True)
+
+
+def sync_recurring_income(
+    db: firestore.Client,
+    uid: str,
+    records: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
+    user_ref = db.collection("users").document(uid)
+    user_snap = user_ref.get()
+    user_data = (user_snap.to_dict() or {}) if user_snap.exists else {}
+    today = date.today()
+    current_month = today.strftime("%Y-%m")
+    active_configs: dict[str, dict[str, Any]] = {}
+
+    for kind, field in (("salary", "salary_config"), ("vale", "vale_config")):
+        cfg = user_data.get(field)
+        if cfg is None:
+            latest_match = next(
+                (item for item in records if infer_recurring_kind(item) == kind),
+                None,
+            )
+            if latest_match is not None and isinstance(latest_match.get("date"), str):
+                try:
+                    rec_date = date.fromisoformat(latest_match["date"])
+                except ValueError:
+                    rec_date = None
+                if rec_date is not None and int(latest_match.get("amount_cents", 0)) > 0:
+                    default_label = "Salário" if kind == "salary" else "Vale"
+                    cfg = {
+                        "amount_cents": int(latest_match["amount_cents"]),
+                        "day": rec_date.day,
+                        "description": str(latest_match.get("description") or default_label),
+                        "category": str(latest_match.get("category") or default_label),
+                        "start_month": rec_date.strftime("%Y-%m"),
+                        "last_saved_date": rec_date.isoformat(),
+                        "deleted_months": [],
+                        "active": True,
+                        "updated_at": datetime.now(timezone.utc),
+                    }
+                    user_ref.set({field: cfg}, merge=True)
+
+        if not isinstance(cfg, dict) or not cfg.get("active", True):
+            continue
+        amount_cents = int(cfg.get("amount_cents", 0))
+        if amount_cents <= 0:
+            continue
+
+        active_configs[kind] = cfg
+        pay_day = int(cfg.get("day", 1))
+        default_label = "Salário" if kind == "salary" else "Vale"
+        description = str(cfg.get("description") or default_label)
+        category = str(cfg.get("category") or default_label)
+        start_month = str(cfg.get("start_month") or current_month)
+        deleted_months = set(cfg.get("deleted_months") or [])
+
+        for month_key in iter_months(start_month, current_month):
+            if month_key in deleted_months:
+                continue
+            already_has = any(
+                str(item.get("date", "")).startswith(month_key)
+                and infer_recurring_kind(item) == kind
+                for item in records
+            )
+            if already_has:
+                continue
+            year, month = map(int, month_key.split("-"))
+            scheduled_date = clamp_day_to_month(year, month, pay_day)
+            if scheduled_date <= today:
+                now_utc = datetime.now(timezone.utc)
+                new_doc_ref = db.collection("transactions").document()
+                new_record: dict[str, Any] = {
+                    "owner_uid": uid,
+                    "type": "receita",
+                    "description": description,
+                    "amount_cents": amount_cents,
+                    "category": category,
+                    "date": scheduled_date.isoformat(),
+                    "recurring_kind": kind,
+                    "recurring_month": month_key,
+                    "recurring_day": pay_day,
+                    "created_at": now_utc,
+                }
+                new_doc_ref.create(new_record)
+                new_record["id"] = new_doc_ref.id
+                records.append(new_record)
+
+    records.sort(
+        key=lambda item: (str(item.get("date", "")), str(item.get("created_at", ""))),
+        reverse=True,
+    )
+    return records, active_configs
+
+
+def delete_transaction(db: Any, uid: str, transaction_id: str) -> None:
     transaction_ref = db.collection("transactions").document(transaction_id)
-    transaction = db.transaction()
+    deleted_record: dict[str, Any] = {}
 
-    @firestore.transactional
     def delete_owned_transaction(transaction: Any) -> None:
         snapshot = transaction_ref.get(transaction=transaction)
         if not snapshot.exists or snapshot.get("owner_uid") != uid:
             raise PermissionError("Lançamento não encontrado para este usuário.")
+        deleted_record.update(snapshot.to_dict() or {})
         transaction.delete(transaction_ref)
 
-    delete_owned_transaction(transaction)
+    run_in_transaction(db, delete_owned_transaction)
+
+    kind = infer_recurring_kind(deleted_record)
+    rec_date = str(deleted_record.get("date", ""))
+    if kind in ("salary", "vale") and len(rec_date) >= 7:
+        month_key = rec_date[:7]
+        field = "salary_config" if kind == "salary" else "vale_config"
+        user_ref = db.collection("users").document(uid)
+        user_snap = user_ref.get()
+        cfg = (user_snap.to_dict() or {}).get(field) if user_snap.exists else None
+        if isinstance(cfg, dict):
+            deleted_months = list(cfg.get("deleted_months") or [])
+            if month_key not in deleted_months:
+                deleted_months.append(month_key)
+                cfg = dict(cfg)
+                cfg["deleted_months"] = deleted_months
+                user_ref.set({field: cfg}, merge=True)
 
 
 def report_database_error(action: str, error: Exception) -> None:
@@ -387,22 +792,174 @@ def render_authentication(db: firestore.Client) -> None:
                     report_database_error("criar a conta", error)
 
 
+def _render_recurring_income_tab(
+    db: firestore.Client,
+    user: dict[str, str],
+    kind: str,
+    cfg: dict[str, Any] | None,
+) -> None:
+    label_singular = "Salário" if kind == "salary" else "Vale"
+    label_lower = "salário" if kind == "salary" else "vale"
+    today = date.today()
+
+    if cfg is not None:
+        saved_cents = int(cfg["amount_cents"])
+        saved_day = int(cfg.get("day", today.day))
+        initial_amount = f"{saved_cents / 100:.2f}".replace(".", ",")
+        initial_description = str(cfg.get("description") or label_singular)
+        initial_category = str(cfg.get("category") or label_singular)
+        initial_date = clamp_day_to_month(today.year, today.month, saved_day)
+        st.markdown(
+            f'<div class="recurring-banner">'
+            f'<div class="recurring-banner-icon">✓</div>'
+            f'<div class="recurring-banner-text">'
+            f'<strong>{html.escape(label_singular)} salvo: {money(saved_cents)}</strong>'
+            f'<span>Cai automaticamente todo mês no dia <b>{saved_day:02d}</b>. '
+            f'Altere abaixo se desejar atualizar o valor ou o dia.</span>'
+            f'</div></div>',
+            unsafe_allow_html=True,
+        )
+    else:
+        initial_amount = ""
+        initial_description = label_singular
+        initial_category = label_singular
+        initial_date = today
+        st.markdown(
+            f'<div class="recurring-banner recurring-banner-empty">'
+            f'<div class="recurring-banner-icon">📅</div>'
+            f'<div class="recurring-banner-text">'
+            f'<strong>Configurar {html.escape(label_lower)} mensal</strong>'
+            f'<span>Ao salvar seu {html.escape(label_lower)}, ele ficará registrado e cairá '
+            f'automaticamente todo mês no dia escolhido.</span>'
+            f'</div></div>',
+            unsafe_allow_html=True,
+        )
+
+    form_key = f"transaction_form_{kind}"
+    with st.form(form_key):
+        description = st.text_input(
+            "Descrição",
+            value=initial_description,
+            max_chars=100,
+            key=f"{form_key}_description",
+        )
+        amount_text = st.text_input(
+            f"Valor do {label_lower} (R$)",
+            value=initial_amount,
+            placeholder="Ex.: 2500,00" if kind == "salary" else "Ex.: 800,00",
+            max_chars=15,
+            key=f"{form_key}_amount",
+        )
+        category = st.text_input(
+            "Categoria",
+            value=initial_category,
+            max_chars=40,
+            placeholder=label_singular,
+            key=f"{form_key}_category",
+        )
+        transaction_date = st.date_input(
+            "Data de recebimento (cairá todo mês neste dia)",
+            value=initial_date,
+            key=f"{form_key}_date",
+        )
+        save_clicked = st.form_submit_button(
+            f"Salvar {label_lower}",
+            use_container_width=True,
+            type="primary",
+        )
+
+    if cfg is not None:
+        if st.button(
+            f"Desativar recorrência automática de {label_lower}",
+            key=f"disable_rec_{kind}",
+            use_container_width=True,
+        ):
+            try:
+                disable_recurring_income(db, user["uid"], kind)
+                st.session_state["saved_message"] = (
+                    f"Recorrência automática de {label_lower} desativada."
+                )
+                st.rerun()
+            except (GoogleAPICallError, RuntimeError) as error:
+                report_database_error(f"desativar o {label_lower} automático", error)
+
+    if save_clicked:
+        try:
+            clean_description = description.strip()
+            clean_category = category.strip()
+            if not clean_description:
+                raise ValueError("Informe uma descrição.")
+            if not clean_category:
+                raise ValueError("Informe uma categoria.")
+            amount_cents = parse_amount(amount_text)
+            save_recurring_income(
+                db,
+                user["uid"],
+                kind,
+                clean_description,
+                amount_cents,
+                clean_category,
+                transaction_date,
+            )
+            st.session_state["selected_month"] = transaction_date.strftime("%Y-%m")
+            st.session_state["page"] = "home"
+            st.session_state["saved_message"] = (
+                f"{label_singular} de {money(amount_cents)} salvo com sucesso! "
+                f"Ele cairá todo mês no dia {transaction_date.day:02d}."
+            )
+            st.rerun()
+        except ValueError as error:
+            st.error(str(error))
+        except PermissionError as error:
+            st.error(str(error))
+        except (GoogleAPICallError, RuntimeError) as error:
+            report_database_error(f"salvar o {label_lower}", error)
+
+
+def render_income_tabs(db: firestore.Client, user: dict[str, str]) -> None:
+    st.subheader("Lançar Salário e Vale")
+    if st.session_state.get("saved_message"):
+        st.success(st.session_state.pop("saved_message"))
+
+    try:
+        records = list_transactions(db, user["uid"])
+        _, configs = sync_recurring_income(db, user["uid"], records)
+    except (GoogleAPICallError, RuntimeError) as error:
+        report_database_error("carregar configurações de salário e vale", error)
+        configs = {}
+
+    prefer_vale = st.session_state.get("income_tab") == "vale"
+    if prefer_vale:
+        tab_vale, tab_salary = st.tabs(["💳 Lançar Vale", "💰 Lançar Salário"])
+    else:
+        tab_salary, tab_vale = st.tabs(["💰 Lançar Salário", "💳 Lançar Vale"])
+
+    with tab_salary:
+        _render_recurring_income_tab(db, user, "salary", configs.get("salary"))
+
+    with tab_vale:
+        _render_recurring_income_tab(db, user, "vale", configs.get("vale"))
+
+    if st.button("Voltar", key="income_tabs_back", use_container_width=True):
+        st.session_state["page"] = "home"
+        st.rerun()
+
+
 def render_transaction_form(
     db: firestore.Client,
     user: dict[str, str],
     transaction: dict[str, Any] | None = None,
     salary_entry: bool = False,
 ) -> None:
+    if salary_entry and transaction is None:
+        render_income_tabs(db, user)
+        return
+
     is_editing = transaction is not None
-    page_title = (
-        "Editar lançamento" if is_editing
-        else "Adicionar salário" if salary_entry
-        else "Adicionar gasto"
-    )
+    page_title = "Editar lançamento" if is_editing else "Adicionar gasto"
     st.subheader(page_title)
     form_key = (
         f"transaction_form_{transaction['id']}" if is_editing
-        else "transaction_form_salary" if salary_entry
         else "transaction_form_new"
     )
     initial_amount = f"{transaction['amount_cents'] / 100:.2f}".replace(".", ",") if is_editing else ""
@@ -414,16 +971,14 @@ def render_transaction_form(
                 "Tipo",
                 ["receita", "despesa"],
                 index=type_index,
-                format_func=lambda value: "Salário" if value == "receita" else "Despesa (Gasto)",
+                format_func=lambda value: "Salário / Vale (Receita)" if value == "receita" else "Despesa (Gasto)",
                 key=f"{form_key}_type",
             )
-        elif salary_entry:
-            transaction_type = "receita"
         else:
             transaction_type = "despesa"
         description = st.text_input(
             "Descrição",
-            value=transaction["description"] if is_editing else "Salário" if salary_entry else "",
+            value=transaction["description"] if is_editing else "",
             max_chars=100,
             key=f"{form_key}_description",
         )
@@ -436,7 +991,7 @@ def render_transaction_form(
         )
         category = st.text_input(
             "Categoria",
-            value=transaction["category"] if is_editing else "Salário" if salary_entry else "",
+            value=transaction["category"] if is_editing else "",
             max_chars=40,
             placeholder="Ex.: Alimentação",
             key=f"{form_key}_category",
@@ -446,11 +1001,7 @@ def render_transaction_form(
             value=date.fromisoformat(transaction["date"]) if is_editing else date.today(),
             key=f"{form_key}_date",
         )
-        submit_label = (
-            "Salvar alterações" if is_editing
-            else "Salvar salário" if salary_entry
-            else "Salvar gasto"
-        )
+        submit_label = "Salvar alterações" if is_editing else "Salvar gasto"
         save_clicked = st.form_submit_button(submit_label, use_container_width=True, type="primary")
 
     if st.button("Voltar", key=f"{form_key}_back", use_container_width=True):
@@ -465,17 +1016,40 @@ def render_transaction_form(
                 raise ValueError("Informe uma descrição.")
             if not clean_category:
                 raise ValueError("Informe uma categoria.")
-            transaction_data = {
+            amount_cents = parse_amount(amount_text)
+            transaction_data: dict[str, Any] = {
                 "type": transaction_type,
                 "description": clean_description,
-                "amount_cents": parse_amount(amount_text),
+                "amount_cents": amount_cents,
                 "category": clean_category,
                 "date": transaction_date.isoformat(),
             }
+            if is_editing and transaction is not None:
+                rec_kind = infer_recurring_kind(transaction) or infer_recurring_kind(transaction_data)
+                if rec_kind in ("salary", "vale") and transaction_type == "receita":
+                    transaction_data["recurring_kind"] = rec_kind
+                    transaction_data["recurring_month"] = transaction_date.strftime("%Y-%m")
+                    transaction_data["recurring_day"] = transaction_date.day
+                    field = "salary_config" if rec_kind == "salary" else "vale_config"
+                    db.collection("users").document(user["uid"]).set(
+                        {
+                            field: {
+                                "amount_cents": amount_cents,
+                                "day": transaction_date.day,
+                                "description": clean_description,
+                                "category": clean_category,
+                                "start_month": transaction_date.strftime("%Y-%m"),
+                                "last_saved_date": transaction_date.isoformat(),
+                                "active": True,
+                                "updated_at": datetime.now(timezone.utc),
+                            }
+                        },
+                        merge=True,
+                    )
             save_transaction(db, user["uid"], transaction["id"] if is_editing else None, transaction_data)
             st.session_state["page"] = "home"
             st.session_state["saved_message"] = (
-                "Salário salvo com sucesso." if transaction_type == "receita" else "Gasto registrado com sucesso."
+                "Receita salva com sucesso." if transaction_type == "receita" else "Gasto registrado com sucesso."
             )
             st.rerun()
         except ValueError as error:
@@ -564,7 +1138,8 @@ def answer_financial_ai_question(
 def render_home(db: firestore.Client, user: dict[str, str]) -> None:
     try:
         records = list_transactions(db, user["uid"])
-    except (GoogleAPICallError, KeyError, TypeError) as error:
+        records, recurring_configs = sync_recurring_income(db, user["uid"], records)
+    except (GoogleAPICallError, KeyError, TypeError, RuntimeError) as error:
         report_database_error("consultar os lançamentos", error)
         return
 
@@ -602,8 +1177,13 @@ def render_home(db: firestore.Client, user: dict[str, str]) -> None:
         st.session_state["show_gestao"] = False
         st.session_state["show_reports"] = True
         st.rerun()
-    if st.sidebar.button("＋  Salário", key="sb_salary", use_container_width=True):
+    if st.sidebar.button("＋  Lançar Salário", key="sb_salary", use_container_width=True):
         st.session_state["page"] = "salary"
+        st.session_state["income_tab"] = "salary"
+        st.rerun()
+    if st.sidebar.button("＋  Lançar Vale", key="sb_vale", use_container_width=True):
+        st.session_state["page"] = "salary"
+        st.session_state["income_tab"] = "vale"
         st.rerun()
     if st.sidebar.button("−  Despesas", key="sb_expense", use_container_width=True):
         st.session_state["page"] = "create"
@@ -653,11 +1233,21 @@ def render_home(db: firestore.Client, user: dict[str, str]) -> None:
     )
     balance = income_total - expense_total
     committed_share = min(expense_total / income_total, 1.0) if income_total else 0.0
+    recurring_notes = []
+    if "salary" in recurring_configs:
+        recurring_notes.append(f"Salário todo dia {int(recurring_configs['salary'].get('day', 1)):02d}")
+    if "vale" in recurring_configs:
+        recurring_notes.append(f"Vale todo dia {int(recurring_configs['vale'].get('day', 1)):02d}")
+    income_note_text = (
+        " · ".join(recurring_notes)
+        if recurring_notes
+        else f"Recebido em {html.escape(period_label)}"
+    )
     st.markdown(
         f'<div class="metrics-row">'
-        f'<div class="metric-card metric-income"><div class="metric-label">Salário recebido</div>'
+        f'<div class="metric-card metric-income"><div class="metric-label">Salário e Vale recebidos</div>'
         f'<div class="metric-val">{money(income_total)}</div>'
-        f'<div class="metric-note">✓ &nbsp; Recebido em {html.escape(period_label)}</div></div>'
+        f'<div class="metric-note">✓ &nbsp; {income_note_text}</div></div>'
         f'<div class="metric-card metric-expense"><div class="metric-label">Despesas do mês</div>'
         f'<div class="metric-val">{money(expense_total)}</div>'
         f'<div class="metric-note">{committed_share:.0%} do salário utilizado</div>'
@@ -739,8 +1329,13 @@ def render_home(db: firestore.Client, user: dict[str, str]) -> None:
             '<p>O que você deseja fazer?</p></div></div>',
             unsafe_allow_html=True,
         )
-        if st.button("＋  Adicionar salário", key="quick_add_salary", use_container_width=True):
+        if st.button("＋  Lançar salário", key="quick_add_salary", use_container_width=True):
             st.session_state["page"] = "salary"
+            st.session_state["income_tab"] = "salary"
+            st.rerun()
+        if st.button("＋  Lançar vale", key="quick_add_vale", use_container_width=True):
+            st.session_state["page"] = "salary"
+            st.session_state["income_tab"] = "vale"
             st.rerun()
         if st.button("−  Adicionar gasto", key="quick_add_expense", use_container_width=True):
             st.session_state["page"] = "create"
@@ -1225,6 +1820,65 @@ def main() -> None:
         }
         .st-key-ai_question_form {
             max-width: none;
+        }
+
+        /* ── Recurring Income Banner & Tabs ── */
+        div[data-testid="stTabs"] {
+            max-width: 720px;
+            margin: 0 auto 1rem;
+        }
+        div[data-testid="stTabs"] button[data-baseweb="tab"] {
+            font-weight: 700 !important;
+            font-size: 0.96rem !important;
+            color: #475569 !important;
+            padding: 0.65rem 1.2rem !important;
+        }
+        div[data-testid="stTabs"] button[data-baseweb="tab"][aria-selected="true"] {
+            color: #059669 !important;
+        }
+        .recurring-banner {
+            display: flex;
+            align-items: center;
+            gap: 14px;
+            max-width: 720px;
+            margin: 0.5rem auto 1rem;
+            padding: 1rem 1.25rem;
+            border-radius: 16px;
+            background: linear-gradient(135deg, #ecfdf5 0%, #d1fae5 100%);
+            border: 1px solid #a7f3d0;
+            color: #064e3b;
+        }
+        .recurring-banner-empty {
+            background: #f8fafc;
+            border: 1px solid #e2e8f0;
+            color: #334155;
+        }
+        .recurring-banner-icon {
+            display: grid;
+            place-items: center;
+            width: 38px;
+            height: 38px;
+            flex: 0 0 38px;
+            border-radius: 12px;
+            background: #059669;
+            color: #ffffff;
+            font-weight: 800;
+            font-size: 1.1rem;
+        }
+        .recurring-banner-empty .recurring-banner-icon {
+            background: #e2e8f0;
+            color: #475569;
+        }
+        .recurring-banner-text strong {
+            display: block;
+            font-size: 0.92rem;
+            font-weight: 750;
+            margin-bottom: 2px;
+        }
+        .recurring-banner-text span {
+            display: block;
+            font-size: 0.8rem;
+            opacity: 0.9;
         }
 
         /* ── Text Inputs ── */
