@@ -970,8 +970,17 @@ def month_label(month_key: str) -> str:
 def render_authentication(db: firestore.Client) -> None:
     with st.container():
         st.markdown(
-            '<div class="brand"><h1>Minhas finanças</h1>'
-            '<p>Seu dinheiro mais organizado, suas escolhas mais tranquilas.</p></div>',
+            '<div class="brand">'
+            '<div class="brand-badge"><span>✓</span> nuvem finanças · 2026</div>'
+            '<h1>Minhas finanças</h1>'
+            '<p>Seu dinheiro mais organizado, suas escolhas mais tranquilas.</p>'
+            '<div class="brand-features">'
+            '<span class="brand-pill">🔒 Contas individuais</span>'
+            '<span class="brand-pill">💰 Salário e Vale automáticos</span>'
+            '<span class="brand-pill">⚡ Controle de Bicos</span>'
+            '<span class="brand-pill">🤖 IA Financeira Gratuita</span>'
+            '</div>'
+            '</div>',
             unsafe_allow_html=True,
         )
         auth_mode = st.session_state.get("auth_mode", "login")
@@ -1311,7 +1320,14 @@ def _render_extra_income_tab(
 
 
 def render_income_tabs(db: Any, user: dict[str, Any]) -> None:
-    st.subheader("Receitas: Salário, Vale e Dinheiro Extra (Bicos)")
+    st.markdown(
+        '<div class="page-hero-banner">'
+        '<div class="page-hero-icon">💰</div>'
+        '<div><h2>Central de Receitas</h2>'
+        '<p>Configure seu Salário e Vale mensais automáticos ou adicione Dinheiro Extra e Bicos.</p></div>'
+        '</div>',
+        unsafe_allow_html=True,
+    )
     if st.session_state.get("saved_message"):
         st.success(st.session_state.pop("saved_message"))
 
@@ -1496,8 +1512,16 @@ def render_transaction_form(
         return
 
     is_editing = transaction is not None
-    page_title = "Editar lançamento" if is_editing else "Adicionar gasto"
-    st.subheader(page_title)
+    page_title = "Editar lançamento" if is_editing else "Registrar nova despesa"
+    page_sub = "Atualize os dados do lançamento selecionado." if is_editing else "Adicione seus gastos do mês para manter o controle total do seu saldo."
+    page_icon = "✏️" if is_editing else "📉"
+    st.markdown(
+        f'<div class="page-hero-banner page-hero-expense">'
+        f'<div class="page-hero-icon">{page_icon}</div>'
+        f'<div><h2>{page_title}</h2><p>{page_sub}</p></div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
     form_key = (
         f"transaction_form_{transaction['id']}" if is_editing
         else "transaction_form_new"
@@ -1954,14 +1978,18 @@ def render_home(db: Any, user: dict[str, Any]) -> None:
     header_avatar = (
         f'<img src="{photo_url}" class="welcome-avatar-img" alt="Foto">'
         if photo_url
-        else ""
+        else f'<div class="welcome-avatar-fallback">{html.escape(str(display_name)[:1].upper())}</div>'
     )
-    header_col, month_col = st.columns([3, 1.2], vertical_alignment="center")
+    header_col, month_col = st.columns([3.1, 1.1], vertical_alignment="center")
     with header_col:
         st.markdown(
-            f'<div class="welcome-header"><div class="welcome-date">{html.escape(date_text)} {work_badge}</div>'
-            f'<div class="welcome-title-row">{header_avatar}<h1>Olá, {html.escape(str(display_name))} 👋</h1></div>'
-            '<p>Acompanhe seu salário, vale, ganhos extras e despesas do mês.</p></div>',
+            f'<div class="welcome-hero-banner">'
+            f'{header_avatar}'
+            f'<div class="welcome-hero-content">'
+            f'<div class="welcome-date"><span class="welcome-date-pill">📅 {html.escape(date_text)}</span> {work_badge}</div>'
+            f'<h1>Olá, {html.escape(str(display_name))} 👋</h1>'
+            f'<p>Acompanhe seu salário, vale, bicos e despesas com controle inteligente em tempo real.</p>'
+            f'</div></div>',
             unsafe_allow_html=True,
         )
     with month_col:
@@ -2014,21 +2042,32 @@ def render_home(db: Any, user: dict[str, Any]) -> None:
         if extra_incomes
         else "Adicione bicos ou rendas extras"
     )
+    balance_status_note = (
+        "✨ Saldo positivo e saudável"
+        if balance > 0
+        else "⚠️ Atenção ao saldo do mês"
+        if balance < 0
+        else "Saldo zerado no momento"
+    )
     st.markdown(
         f'<div class="metrics-row metrics-row-4">'
-        f'<div class="metric-card metric-income"><div class="metric-label">Salário e Vale recebidos</div>'
+        f'<div class="metric-card metric-income">'
+        f'<div class="metric-top"><div class="metric-label">Salário e Vale recebidos</div><span class="metric-icon-badge">💰</span></div>'
         f'<div class="metric-val">{money(salary_vale_total)}</div>'
         f'<div class="metric-note">{income_note_text}</div></div>'
-        f'<div class="metric-card metric-extra"><div class="metric-label">Dinheiro Extra / Bicos</div>'
+        f'<div class="metric-card metric-extra">'
+        f'<div class="metric-top"><div class="metric-label">Dinheiro Extra / Bicos</div><span class="metric-icon-badge">⚡</span></div>'
         f'<div class="metric-val">{money(extra_total)}</div>'
         f'<div class="metric-note">{extra_note_text}</div></div>'
-        f'<div class="metric-card metric-expense"><div class="metric-label">Despesas do mês</div>'
+        f'<div class="metric-card metric-expense">'
+        f'<div class="metric-top"><div class="metric-label">Despesas do mês</div><span class="metric-icon-badge">📉</span></div>'
         f'<div class="metric-val">{money(expense_total)}</div>'
         f'<div class="metric-note">{committed_share:.0%} da renda utilizada</div>'
         f'<div class="metric-progress"><span style="width:{committed_share:.0%}"></span></div></div>'
-        f'<div class="metric-card metric-balance"><div class="metric-label">Saldo disponível</div>'
+        f'<div class="metric-card metric-balance">'
+        f'<div class="metric-top"><div class="metric-label">Saldo disponível</div><span class="metric-icon-badge">🏦</span></div>'
         f'<div class="metric-val">{money(balance)}</div>'
-        f'<div class="metric-note">Total (Salário + Vale + Bicos − Gastos)</div></div>'
+        f'<div class="metric-note">{balance_status_note}</div></div>'
         f'</div>',
         unsafe_allow_html=True,
     )
@@ -2228,17 +2267,18 @@ def render_home(db: Any, user: dict[str, Any]) -> None:
 
     # 5. Chat de dúvidas financeiras
     st.markdown(
-        '<div class="ai-heading">'
-        '🤖 Tire Dúvidas com a IA Financeira'
+        '<div class="ai-banner-card">'
+        '<div class="ai-banner-icon">✨</div>'
+        '<div>'
+        '<div class="ai-banner-badge">IA FINANCEIRA GRATUITA</div>'
+        '<h3>Tire Dúvidas com a IA Financeira</h3>'
+        '<p>Pergunte sobre seus gastos, bicos, saldo ou dicas de economia para este mês.</p>'
+        '</div>'
         '</div>',
         unsafe_allow_html=True,
     )
 
-    st.caption(
-        "Pergunte sobre suas finanças. A IA recebe somente os totais e as categorias "
-        "do período selecionado, sem descrições dos lançamentos."
-    )
-    chip1, chip2, chip3 = st.columns(3)
+    chip1, chip2, chip3, chip4 = st.columns(4)
     quick_question = None
     with chip1:
         if st.button("🔍 Maior gasto?", key="chip_maior_gasto", use_container_width=True):
@@ -2247,6 +2287,9 @@ def render_home(db: Any, user: dict[str, Any]) -> None:
         if st.button("💰 Saldo atual?", key="chip_saldo", use_container_width=True):
             quick_question = "Quanto sobrou de saldo?"
     with chip3:
+        if st.button("⚡ Meus bicos?", key="chip_bicos", use_container_width=True):
+            quick_question = "Quanto ganhei de bico e dinheiro extra?"
+    with chip4:
         if st.button("💡 Economizar?", key="chip_dica", use_container_width=True):
             quick_question = "Como posso economizar este mês?"
 
@@ -2313,24 +2356,28 @@ def main() -> None:
     st.markdown(
         """
         <style>
-        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap');
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=Plus+Jakarta+Sans:wght@600;700;800&display=swap');
 
         :root { color-scheme: light; }
 
         /* ── App Background ── */
         .stApp {
             background:
-                radial-gradient(ellipse at 8% 0%, rgba(16,185,129,0.10), transparent 34%),
-                radial-gradient(ellipse at 100% 12%, rgba(56,189,248,0.09), transparent 30%),
-                #f6f8fb !important;
+                radial-gradient(ellipse at 0% 0%, rgba(16, 185, 129, 0.13), transparent 38%),
+                radial-gradient(ellipse at 100% 0%, rgba(14, 165, 233, 0.11), transparent 36%),
+                radial-gradient(ellipse at 50% 100%, rgba(245, 158, 11, 0.06), transparent 40%),
+                #f1f5f9 !important;
             font-family: 'Inter', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
             color: #0f172a;
+        }
+        h1, h2, h3, .metric-val, .brand h1 {
+            font-family: 'Plus Jakarta Sans', 'Inter', sans-serif;
         }
 
         /* ── Main Container ── */
         .block-container {
             max-width: 1480px;
-            padding: 2rem 2.2rem 5rem;
+            padding: 1.75rem 2.2rem 5rem;
         }
 
         /* ── Hide Streamlit branding ── */
@@ -2342,52 +2389,113 @@ def main() -> None:
 
         /* ── Sidebar ── */
         [data-testid="stSidebar"] {
-            background: #ffffff !important;
-            border-right: 1px solid #edf1ee !important;
+            background: linear-gradient(180deg, #ffffff 0%, #f8fafc 100%) !important;
+            border-right: 1px solid #e2e8f0 !important;
+            box-shadow: 4px 0 24px rgba(15, 23, 42, 0.03);
         }
         [data-testid="stSidebar"] * {
-            color: #53635e;
+            color: #475569;
         }
         [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] h1 {
-            color: #173a32 !important;
+            color: #0f172a !important;
             font-size: 1.3rem;
             font-weight: 800;
         }
         [data-testid="stSidebar"] div.stButton > button {
             text-align: left;
-            background: transparent !important;
-            border: 1px solid transparent !important;
-            color: #697672 !important;
-            border-radius: 12px !important;
-            min-height: 44px;
+            background: #ffffff !important;
+            border: 1px solid #eef2f6 !important;
+            color: #334155 !important;
+            border-radius: 14px !important;
+            min-height: 45px;
             font-size: 0.88rem !important;
+            font-weight: 600 !important;
+            box-shadow: 0 2px 5px rgba(15, 23, 42, 0.02);
         }
         [data-testid="stSidebar"] div.stButton > button:hover {
-            background: #eaf6f1 !important;
-            border-color: #d9eee4 !important;
-            color: #176b50 !important;
+            background: #ecfdf5 !important;
+            border-color: #a7f3d0 !important;
+            color: #047857 !important;
+            transform: translateX(3px) !important;
+        }
+        .st-key-sb_logout button {
+            margin-top: 0.6rem !important;
+            background: #fff1f2 !important;
+            border-color: #fecdd3 !important;
+            color: #be123c !important;
+        }
+        .st-key-sb_logout button:hover {
+            background: #ffe4e6 !important;
+            border-color: #fda4af !important;
+            color: #9f1239 !important;
         }
 
         /* ── Brand Title (Login) ── */
         .brand {
             text-align: center;
-            padding: 2.5rem 0 1.2rem;
+            padding: 2rem 1rem 1.4rem;
+            max-width: 640px;
+            margin: 0 auto;
+        }
+        .brand-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 5px 14px;
+            margin-bottom: 0.9rem;
+            border-radius: 99px;
+            background: linear-gradient(135deg, #ecfdf5, #d1fae5);
+            border: 1px solid #a7f3d0;
+            color: #065f46;
+            font-size: 0.74rem;
+            font-weight: 800;
+            letter-spacing: 0.06em;
+            text-transform: uppercase;
+        }
+        .brand-badge span {
+            display: inline-grid;
+            place-items: center;
+            width: 18px;
+            height: 18px;
+            border-radius: 50%;
+            background: #059669;
+            color: #ffffff;
+            font-size: 0.65rem;
         }
         .brand h1 {
             margin: 0;
-            font-size: 2.4rem;
+            font-size: clamp(2.1rem, 4vw, 2.75rem);
             font-weight: 900;
-            letter-spacing: -0.04em;
-            background: linear-gradient(135deg, #064e3b 0%, #126b55 40%, #10b981 100%);
+            letter-spacing: -0.045em;
+            background: linear-gradient(135deg, #064e3b 0%, #059669 55%, #0284c7 100%);
             -webkit-background-clip: text;
             -webkit-text-fill-color: transparent;
             text-shadow: none;
         }
         .brand p {
-            margin: 0.55rem 0 0;
-            color: #64748b;
-            font-size: 0.96rem;
+            margin: 0.55rem 0 1rem;
+            color: #475569;
+            font-size: 1rem;
             font-weight: 500;
+        }
+        .brand-features {
+            display: flex;
+            flex-wrap: wrap;
+            justify-content: center;
+            gap: 8px;
+            margin-top: 0.5rem;
+        }
+        .brand-pill {
+            display: inline-flex;
+            align-items: center;
+            padding: 5px 12px;
+            border-radius: 99px;
+            background: #ffffff;
+            border: 1px solid #e2e8f0;
+            color: #334155;
+            font-size: 0.76rem;
+            font-weight: 600;
+            box-shadow: 0 2px 6px rgba(15, 23, 42, 0.03);
         }
 
         /* ── Dashboard Heading ── */
@@ -2575,52 +2683,130 @@ def main() -> None:
             color: #84918e !important;
             font-size: 0.68rem;
         }
-        .welcome-header { padding: 0.15rem 0 1rem; }
+        /* ── Welcome Hero Banner ── */
+        .welcome-hero-banner {
+            display: flex;
+            align-items: center;
+            gap: 18px;
+            padding: 1.25rem 1.5rem;
+            margin-bottom: 0.45rem;
+            border-radius: 22px;
+            background: linear-gradient(135deg, #0b221c 0%, #13392f 55%, #065f46 100%);
+            border: 1px solid rgba(52, 211, 153, 0.25);
+            box-shadow: 0 14px 32px rgba(15, 41, 34, 0.14);
+            color: #ffffff;
+        }
+        .welcome-hero-content {
+            min-width: 0;
+            flex: 1;
+        }
         .welcome-date {
             display: flex;
             flex-wrap: wrap;
             align-items: center;
             gap: 8px;
-            color: #64748b;
-            font-size: 0.78rem;
-            font-weight: 500;
+            margin-bottom: 0.35rem;
+        }
+        .welcome-date-pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            padding: 3px 11px;
+            border-radius: 99px;
+            background: rgba(255, 255, 255, 0.12);
+            border: 1px solid rgba(255, 255, 255, 0.18);
+            color: #d1fae5;
+            font-size: 0.72rem;
+            font-weight: 600;
         }
         .welcome-work-pill {
             display: inline-flex;
             align-items: center;
             gap: 4px;
-            padding: 2px 10px;
+            padding: 3px 11px;
             border-radius: 99px;
-            background: #ecfdf5;
-            border: 1px solid #a7f3d0;
-            color: #065f46;
+            background: rgba(16, 185, 129, 0.25);
+            border: 1px solid rgba(52, 211, 153, 0.4);
+            color: #ecfdf5;
             font-size: 0.72rem;
             font-weight: 700;
         }
-        .welcome-title-row {
-            display: flex;
-            align-items: center;
-            gap: 12px;
-            margin: 0.45rem 0 0.3rem;
-        }
         .welcome-avatar-img {
-            width: 46px;
-            height: 46px;
+            width: 64px;
+            height: 64px;
+            flex: 0 0 64px;
             border-radius: 50%;
             object-fit: cover;
-            border: 2px solid #10b981;
-            box-shadow: 0 4px 12px rgba(16, 185, 129, 0.2);
+            border: 3px solid #34d399;
+            box-shadow: 0 6px 18px rgba(0, 0, 0, 0.28);
         }
-        .welcome-header h1 {
-            margin: 0;
-            color: #0f172a;
-            font-size: clamp(1.55rem, 2.4vw, 2.05rem);
+        .welcome-avatar-fallback {
+            display: grid;
+            place-items: center;
+            width: 64px;
+            height: 64px;
+            flex: 0 0 64px;
+            border-radius: 50%;
+            background: linear-gradient(135deg, #10b981, #059669);
+            color: #ffffff;
+            font-size: 1.65rem;
             font-weight: 800;
-            letter-spacing: -0.04em;
+            border: 2.5px solid rgba(255, 255, 255, 0.35);
+            box-shadow: 0 6px 18px rgba(0, 0, 0, 0.22);
         }
-        .welcome-header p, .section-heading p {
+        .welcome-hero-banner h1 {
+            margin: 0.15rem 0 0.2rem;
+            color: #ffffff !important;
+            font-size: clamp(1.45rem, 2.3vw, 1.95rem);
+            font-weight: 800;
+            letter-spacing: -0.035em;
+        }
+        .welcome-hero-banner p {
+            margin: 0;
+            color: #a7f3d0;
+            font-size: 0.84rem;
+        }
+        .section-heading p {
             margin: 0;
             color: #64748b;
+            font-size: 0.84rem;
+        }
+        /* ── Page Hero Banner (Receitas / Despesas) ── */
+        .page-hero-banner {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+            max-width: 720px;
+            margin: 0 auto 1.2rem;
+            padding: 1.25rem 1.5rem;
+            border-radius: 20px;
+            background: linear-gradient(135deg, #0f2922 0%, #065f46 100%);
+            color: #ffffff;
+            box-shadow: 0 12px 28px rgba(15, 41, 34, 0.14);
+        }
+        .page-hero-expense {
+            background: linear-gradient(135deg, #1e293b 0%, #334155 100%);
+        }
+        .page-hero-icon {
+            display: grid;
+            place-items: center;
+            width: 52px;
+            height: 52px;
+            flex: 0 0 52px;
+            border-radius: 16px;
+            background: rgba(255, 255, 255, 0.14);
+            border: 1px solid rgba(255, 255, 255, 0.22);
+            font-size: 1.55rem;
+        }
+        .page-hero-banner h2 {
+            margin: 0 0 0.2rem;
+            color: #ffffff !important;
+            font-size: 1.35rem;
+            font-weight: 800;
+        }
+        .page-hero-banner p {
+            margin: 0;
+            color: #cbd5e1;
             font-size: 0.84rem;
         }
         /* ── Profile Hero Card ── */
@@ -2696,16 +2882,20 @@ def main() -> None:
             color: #ffffff !important;
         }
         .extra-item-row {
-            padding: 0.55rem 0.85rem;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0.65rem 1rem;
             margin-bottom: 0.35rem;
-            border-radius: 12px;
+            border-radius: 14px;
             background: #ffffff;
             border: 1px solid #e2e8f0;
+            box-shadow: 0 2px 6px rgba(15, 23, 42, 0.03);
         }
         .extra-item-row strong {
             display: block;
             color: #0f172a;
-            font-size: 0.86rem;
+            font-size: 0.88rem;
         }
         .extra-item-row small {
             color: #64748b;
@@ -2715,7 +2905,8 @@ def main() -> None:
             text-align: right;
             font-weight: 800;
             color: #d97706;
-            font-size: 0.92rem;
+            font-size: 0.95rem;
+            white-space: nowrap;
         }
         .section-heading {
             display: flex;
@@ -2725,58 +2916,67 @@ def main() -> None:
         }
         .section-heading h2 {
             margin: 0 0 0.25rem;
-            color: #172522;
-            font-size: 1rem;
-            font-weight: 700;
+            color: #0f172a;
+            font-size: 1.05rem;
+            font-weight: 800;
         }
         .recent-heading { margin-top: 1.6rem; }
-        .record-count { color: #84918e; font-size: 0.75rem; }
+        .record-count {
+            padding: 4px 12px;
+            border-radius: 99px;
+            background: #e2e8f0;
+            color: #334155;
+            font-size: 0.74rem;
+            font-weight: 700;
+        }
         .commitment-card {
-            margin-top: 1.2rem;
-            padding: 1rem;
-            border: 1px solid #edf1ee;
-            border-radius: 15px;
-            background: #fff;
+            margin-top: 1.1rem;
+            padding: 1.1rem 1.2rem;
+            border: 1px solid #e2e8f0;
+            border-radius: 18px;
+            background: linear-gradient(135deg, #ffffff 0%, #f8fafc 100%);
+            box-shadow: 0 6px 18px rgba(15, 23, 42, 0.04);
         }
         .commitment-title {
             display: flex;
             justify-content: space-between;
             align-items: center;
             margin-bottom: 0.75rem;
-            color: #46534f;
-            font-size: 0.78rem;
-            font-weight: 650;
+            color: #334155;
+            font-size: 0.8rem;
+            font-weight: 700;
         }
-        .commitment-title strong { color: #21885f; font-size: 0.95rem; }
-        .commitment-card small { display: block; margin-top: 0.65rem; color: #84918e; font-size: 0.68rem; }
+        .commitment-title strong { color: #059669; font-size: 1rem; font-weight: 800; }
+        .commitment-card small { display: block; margin-top: 0.65rem; color: #64748b; font-size: 0.72rem; }
         .metric-progress {
-            height: 7px;
+            height: 8px;
             overflow: hidden;
             border-radius: 99px;
-            background: #edf1ee;
+            background: #e2e8f0;
         }
         .metric-progress span {
             display: block;
             height: 100%;
             border-radius: inherit;
-            background: #27b887;
+            background: linear-gradient(90deg, #10b981, #059669);
         }
         .record-icon {
             display: grid;
-            width: 34px;
-            height: 34px;
+            width: 38px;
+            height: 38px;
             place-items: center;
-            border-radius: 50%;
-            font-weight: 700;
+            border-radius: 12px;
+            font-weight: 800;
+            font-size: 1rem;
         }
-        .record-icon.income { background: #eaf6f0; color: #21885f; }
-        .record-icon.expense { background: #fff2ed; color: #d87455; }
+        .record-icon.income { background: #dcfce7; color: #15803d; }
+        .record-icon.expense { background: #fee2e2; color: #b91c1c; }
         .record-description strong, .record-description small { display: block; }
-        .record-description strong { color: #26352f; font-size: 0.8rem; }
-        .record-description small { margin-top: 3px; color: #84918e; font-size: 0.68rem; }
-        .record-amount { text-align: right; font-size: 0.78rem; font-weight: 700; }
-        .record-amount.income { color: #21885f; }
-        .record-amount.expense { color: #b95e46; }
+        .record-description strong { color: #0f172a; font-size: 0.86rem; font-weight: 700; }
+        .record-description small { margin-top: 3px; color: #64748b; font-size: 0.72rem; }
+        .record-amount { text-align: right; font-size: 0.88rem; font-weight: 800; }
+        .record-amount.income { color: #059669; }
+        .record-amount.expense { color: #dc2626; }
 
         /* ── Form Cards ── */
         div[data-testid="stForm"] {
@@ -3010,7 +3210,7 @@ def main() -> None:
             display: grid;
             grid-template-columns: repeat(3, minmax(0, 1fr));
             gap: 16px;
-            margin: 0.7rem 0 1rem;
+            margin: 0.7rem 0 1.25rem;
             width: 100%;
         }
         .metrics-row-4 {
@@ -3020,12 +3220,12 @@ def main() -> None:
             flex: 1;
             min-width: 0;
             background: #ffffff;
-            border: 1px solid rgba(15, 23, 42, 0.06);
-            border-radius: 20px;
+            border: 1px solid rgba(15, 23, 42, 0.07);
+            border-radius: 22px;
             padding: 20px 21px;
             text-align: left;
-            box-shadow: 0 8px 22px rgba(15,23,42,0.05), 0 1px 3px rgba(15,23,42,0.02);
-            transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+            box-shadow: 0 10px 26px rgba(15,23,42,0.05), 0 1px 3px rgba(15,23,42,0.02);
+            transition: all 0.22s cubic-bezier(0.4, 0, 0.2, 1);
             position: relative;
             overflow: hidden;
         }
@@ -3042,27 +3242,56 @@ def main() -> None:
         .metric-expense::before { background: linear-gradient(90deg, #ef4444, #f87171); }
         .metric-balance::before { background: linear-gradient(90deg, #0284c7, #38bdf8); }
         .metric-card:hover {
-            transform: translateY(-3px);
-            box-shadow: 0 14px 30px rgba(15, 23, 42, 0.09);
+            transform: translateY(-4px);
+            box-shadow: 0 16px 34px rgba(15, 23, 42, 0.10);
+        }
+        .metric-top {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            margin-bottom: 4px;
+        }
+        .metric-icon-badge {
+            display: grid;
+            place-items: center;
+            width: 34px;
+            height: 34px;
+            flex: 0 0 34px;
+            border-radius: 11px;
+            background: rgba(15, 23, 42, 0.05);
+            font-size: 1rem;
+        }
+        .metric-income .metric-icon-badge {
+            background: rgba(255, 255, 255, 0.14);
+        }
+        .metric-extra .metric-icon-badge {
+            background: rgba(217, 119, 6, 0.15);
+        }
+        .metric-expense .metric-icon-badge {
+            background: #fee2e2;
+        }
+        .metric-balance .metric-icon-badge {
+            background: #e0f2fe;
         }
         .metric-label {
             font-size: 0.78rem;
             font-weight: 700;
             color: #64748b;
-            margin-bottom: 6px;
+            margin-bottom: 0;
             text-transform: none;
             letter-spacing: 0;
         }
         .metric-val {
-            margin: 0.65rem 0;
-            font-size: clamp(1.2rem, 2.2vw, 1.65rem);
+            margin: 0.55rem 0;
+            font-size: clamp(1.22rem, 2.2vw, 1.68rem);
             font-weight: 800;
-            letter-spacing: -0.025em;
+            letter-spacing: -0.03em;
             white-space: nowrap;
         }
         .metric-income {
-            background: linear-gradient(135deg, #0f2922 0%, #173a32 60%, #065f46 100%);
-            border-color: #173a32;
+            background: linear-gradient(135deg, #0b221c 0%, #13392f 55%, #065f46 100%);
+            border-color: #13392f;
         }
         .metric-income .metric-label { color: #a7f3d0; }
         .metric-income .metric-val { color: #ffffff; }
@@ -3074,8 +3303,14 @@ def main() -> None:
         .metric-extra .metric-label { color: #92400e; }
         .metric-extra .metric-val { color: #b45309; }
         .metric-extra .metric-note { color: #b45309; font-weight: 600; }
-        .metric-expense .metric-val { color: #172522; }
-        .metric-balance .metric-val { color: #0f172a; }
+        .metric-expense .metric-val { color: #0f172a; }
+        .metric-balance {
+            background: linear-gradient(135deg, #f0f9ff 0%, #e0f2fe 100%);
+            border-color: #bae6fd;
+        }
+        .metric-balance .metric-label { color: #0369a1; }
+        .metric-balance .metric-val { color: #0c4a6e; }
+        .metric-balance .metric-note { color: #0284c7; font-weight: 600; }
         .metric-note { color: #64748b; font-size: 0.72rem; }
         .metric-expense .metric-progress { margin-top: 0.75rem; }
 
@@ -3119,44 +3354,85 @@ def main() -> None:
         /* ── Bar Chart ── */
         div[data-testid="stVegaLiteChart"] {
             background: #ffffff;
-            border: 1px solid #e8edf2;
-            border-radius: 18px;
-            padding: 0.75rem;
-            box-shadow: 0 6px 18px rgba(15,23,42,0.04);
+            border: 1px solid #e2e8f0;
+            border-radius: 20px;
+            padding: 0.85rem;
+            box-shadow: 0 8px 22px rgba(15,23,42,0.045);
         }
 
         /* ── AI Chat Section ── */
-        .ai-heading {
-            margin-top: 1.5rem;
-            margin-bottom: 0.35rem;
-            color: #102a24;
-            font-size: 1.16rem;
+        .ai-banner-card {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+            margin-top: 1.8rem;
+            margin-bottom: 0.75rem;
+            padding: 1.15rem 1.4rem;
+            border-radius: 20px;
+            background: linear-gradient(135deg, #0f2922 0%, #134e4a 60%, #0f766e 100%);
+            color: #ffffff;
+            box-shadow: 0 12px 28px rgba(15, 41, 34, 0.14);
+        }
+        .ai-banner-icon {
+            display: grid;
+            place-items: center;
+            width: 48px;
+            height: 48px;
+            flex: 0 0 48px;
+            border-radius: 15px;
+            background: rgba(255, 255, 255, 0.14);
+            border: 1px solid rgba(255, 255, 255, 0.22);
+            font-size: 1.45rem;
+        }
+        .ai-banner-badge {
+            display: inline-block;
+            padding: 2px 9px;
+            margin-bottom: 4px;
+            border-radius: 99px;
+            background: rgba(52, 211, 153, 0.22);
+            border: 1px solid rgba(52, 211, 153, 0.4);
+            color: #a7f3d0;
+            font-size: 0.64rem;
             font-weight: 800;
-            letter-spacing: -0.025em;
+            letter-spacing: 0.08em;
+        }
+        .ai-banner-card h3 {
+            margin: 0 0 2px;
+            color: #ffffff !important;
+            font-size: 1.15rem;
+            font-weight: 800;
+        }
+        .ai-banner-card p {
+            margin: 0;
+            color: #ccfbf1;
+            font-size: 0.8rem;
         }
         [data-testid="stChatMessage"] {
-            border: 1px solid #e8edf2;
-            border-radius: 16px;
-            background: rgba(255,255,255,0.88);
-            box-shadow: 0 3px 10px rgba(15,23,42,0.025);
+            border: 1px solid #e2e8f0;
+            border-radius: 18px;
+            background: #ffffff;
+            box-shadow: 0 4px 14px rgba(15,23,42,0.035);
         }
         .st-key-chip_maior_gasto button,
         .st-key-chip_saldo button,
+        .st-key-chip_bicos button,
         .st-key-chip_dica button {
-            background: #ecfdf5 !important;
+            background: #ffffff !important;
             border: 1.5px solid #a7f3d0 !important;
-            color: #047857 !important;
-            font-weight: 600 !important;
-            font-size: 0.85rem !important;
-            border-radius: 20px !important;
-            min-height: 38px !important;
+            color: #065f46 !important;
+            font-weight: 700 !important;
+            font-size: 0.84rem !important;
+            border-radius: 99px !important;
+            min-height: 40px !important;
+            box-shadow: 0 2px 8px rgba(16, 185, 129, 0.08) !important;
         }
         .st-key-chip_maior_gasto button:hover,
         .st-key-chip_saldo button:hover,
+        .st-key-chip_bicos button:hover,
         .st-key-chip_dica button:hover {
-            background: #d1fae5 !important;
+            background: #ecfdf5 !important;
             border-color: #059669 !important;
-            transform: translateY(-1px) !important;
+            transform: translateY(-2px) !important;
         }
 
         /* ── Gestão Financeira Button ── */
