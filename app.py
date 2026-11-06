@@ -531,22 +531,25 @@ def save_recurring_income(
         ),
         None,
     )
-    transaction_data = {
-        "type": "receita",
-        "description": description,
-        "amount_cents": amount_cents,
-        "category": category,
-        "date": transaction_date.isoformat(),
-        "recurring_kind": kind,
-        "recurring_month": month_key,
-        "recurring_day": pay_day,
-    }
-    save_transaction(
-        db,
-        uid,
-        existing_record["id"] if existing_record is not None else None,
-        transaction_data,
-    )
+    if transaction_date <= date.today():
+        transaction_data = {
+            "type": "receita",
+            "description": description,
+            "amount_cents": amount_cents,
+            "category": category,
+            "date": transaction_date.isoformat(),
+            "recurring_kind": kind,
+            "recurring_month": month_key,
+            "recurring_day": pay_day,
+        }
+        save_transaction(
+            db,
+            uid,
+            existing_record["id"] if existing_record is not None else None,
+            transaction_data,
+        )
+    elif existing_record is not None:
+        db.collection("transactions").document(existing_record["id"]).delete()
 
 
 def disable_recurring_income(db: firestore.Client, uid: str, kind: str) -> None:
@@ -570,6 +573,7 @@ def sync_recurring_income(
     user_snap = user_ref.get()
     user_data = (user_snap.to_dict() or {}) if user_snap.exists else {}
     today = date.today()
+    today_iso = today.isoformat()
     current_month = today.strftime("%Y-%m")
     active_configs: dict[str, dict[str, Any]] = {}
 
@@ -613,6 +617,18 @@ def sync_recurring_income(
         category = str(cfg.get("category") or default_label)
         start_month = str(cfg.get("start_month") or current_month)
         deleted_months = set(cfg.get("deleted_months") or [])
+
+        # Remove any premature recurring transaction dated in the future (> today)
+        future_items = [
+            item
+            for item in records
+            if infer_recurring_kind(item) == kind
+            and str(item.get("date", "")) > today_iso
+        ]
+        for fut in future_items:
+            if "id" in fut:
+                db.collection("transactions").document(fut["id"]).delete()
+            records.remove(fut)
 
         for month_key in iter_months(start_month, current_month):
             if month_key in deleted_months:
@@ -903,10 +919,16 @@ def _render_recurring_income_tab(
             )
             st.session_state["selected_month"] = transaction_date.strftime("%Y-%m")
             st.session_state["page"] = "home"
-            st.session_state["saved_message"] = (
-                f"{label_singular} de {money(amount_cents)} salvo com sucesso! "
-                f"Ele cairá todo mês no dia {transaction_date.day:02d}."
-            )
+            if transaction_date > date.today():
+                st.session_state["saved_message"] = (
+                    f"{label_singular} de {money(amount_cents)} salvo! "
+                    f"Ele só será somado a partir do dia {transaction_date.day:02d} (dia do recebimento)."
+                )
+            else:
+                st.session_state["saved_message"] = (
+                    f"{label_singular} de {money(amount_cents)} salvo com sucesso! "
+                    f"Ele cairá todo mês no dia {transaction_date.day:02d}."
+                )
             st.rerun()
         except ValueError as error:
             st.error(str(error))
@@ -1225,8 +1247,11 @@ def render_home(db: firestore.Client, user: dict[str, str]) -> None:
         )
     displayed_records = [item for item in records if item["date"].startswith(selected_month)]
     period_label = month_label(selected_month)
+    today_iso = today.isoformat()
     income_total = sum(
-        item["amount_cents"] for item in displayed_records if item["type"] == "receita"
+        item["amount_cents"]
+        for item in displayed_records
+        if item["type"] == "receita" and str(item.get("date", "")) <= today_iso
     )
     expense_total = sum(
         item["amount_cents"] for item in displayed_records if item["type"] == "despesa"
@@ -1234,20 +1259,28 @@ def render_home(db: firestore.Client, user: dict[str, str]) -> None:
     balance = income_total - expense_total
     committed_share = min(expense_total / income_total, 1.0) if income_total else 0.0
     recurring_notes = []
-    if "salary" in recurring_configs:
-        recurring_notes.append(f"Salário todo dia {int(recurring_configs['salary'].get('day', 1)):02d}")
-    if "vale" in recurring_configs:
-        recurring_notes.append(f"Vale todo dia {int(recurring_configs['vale'].get('day', 1)):02d}")
+    sel_year, sel_m = map(int, selected_month.split("-"))
+    for kind, label_name in (("salary", "Salário"), ("vale", "Vale")):
+        if kind in recurring_configs:
+            cfg = recurring_configs[kind]
+            pay_day = int(cfg.get("day", 1))
+            sched_date = clamp_day_to_month(sel_year, sel_m, pay_day)
+            if sched_date <= today:
+                recurring_notes.append(f"✓ {label_name} recebido (dia {pay_day:02d})")
+            else:
+                recurring_notes.append(
+                    f"⏳ {label_name} ({money(int(cfg['amount_cents']))}) soma dia {pay_day:02d}"
+                )
     income_note_text = (
         " · ".join(recurring_notes)
         if recurring_notes
-        else f"Recebido em {html.escape(period_label)}"
+        else f"✓ &nbsp; Recebido em {html.escape(period_label)}"
     )
     st.markdown(
         f'<div class="metrics-row">'
         f'<div class="metric-card metric-income"><div class="metric-label">Salário e Vale recebidos</div>'
         f'<div class="metric-val">{money(income_total)}</div>'
-        f'<div class="metric-note">✓ &nbsp; {income_note_text}</div></div>'
+        f'<div class="metric-note">{income_note_text}</div></div>'
         f'<div class="metric-card metric-expense"><div class="metric-label">Despesas do mês</div>'
         f'<div class="metric-val">{money(expense_total)}</div>'
         f'<div class="metric-note">{committed_share:.0%} do salário utilizado</div>'
@@ -1283,7 +1316,9 @@ def render_home(db: firestore.Client, user: dict[str, str]) -> None:
                 {
                     "Mês": month_label(month_key)[:3],
                     "Salário": sum(
-                        item["amount_cents"] for item in month_records if item["type"] == "receita"
+                        item["amount_cents"]
+                        for item in month_records
+                        if item["type"] == "receita" and str(item.get("date", "")) <= today_iso
                     ) / 100,
                     "Despesas": sum(
                         item["amount_cents"] for item in month_records if item["type"] == "despesa"
