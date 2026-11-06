@@ -408,6 +408,161 @@ def authenticate_user(db: Any, username: str, password: str) -> dict[str, Any] |
     }
 
 
+SESSION_FILE_PATH = Path(__file__).resolve().parent / ".sessao_ativa.json"
+
+
+def save_persistent_session(user: dict[str, Any]) -> None:
+    uid = str(user.get("uid", "")).strip()
+    if not uid:
+        return
+    safe_user = {
+        "uid": uid,
+        "username": str(user.get("username", "")),
+        "display_name": str(user.get("display_name") or user.get("username") or "Usuário"),
+        "age": user.get("age", ""),
+        "gender": user.get("gender", ""),
+        "workplace": user.get("workplace", ""),
+        "job_role": user.get("job_role", ""),
+        "photo_data_url": user.get("photo_data_url", ""),
+    }
+    try:
+        SESSION_FILE_PATH.write_text(
+            json.dumps(
+                {
+                    "active": True,
+                    "logged_out": False,
+                    "uid": uid,
+                    "user": _serialize_json_value(safe_user),
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+    try:
+        if st.query_params.get("u") != uid:
+            st.query_params["u"] = uid
+    except Exception:
+        pass
+
+
+def clear_persistent_session() -> None:
+    try:
+        SESSION_FILE_PATH.write_text(
+            json.dumps(
+                {
+                    "active": False,
+                    "logged_out": True,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+    try:
+        st.query_params.clear()
+    except Exception:
+        pass
+
+
+def _build_user_dict_from_snapshot(uid: str, data: dict[str, Any], fallback: dict[str, Any] | None = None) -> dict[str, Any]:
+    base = dict(fallback) if isinstance(fallback, dict) else {}
+    username = str(data.get("username") or base.get("username") or "usuario")
+    display_name = str(data.get("display_name") or base.get("display_name") or username)
+    return {
+        "uid": uid,
+        "username": username,
+        "display_name": display_name,
+        "age": data.get("age", base.get("age", "")),
+        "gender": data.get("gender", base.get("gender", "")),
+        "workplace": data.get("workplace", base.get("workplace", "")),
+        "job_role": data.get("job_role", base.get("job_role", "")),
+        "photo_data_url": data.get("photo_data_url", base.get("photo_data_url", "")),
+    }
+
+
+def restore_persistent_session(db: Any) -> dict[str, Any] | None:
+    current_user = st.session_state.get("user")
+    if isinstance(current_user, dict) and current_user.get("uid"):
+        save_persistent_session(current_user)
+        return current_user
+
+    saved_state: dict[str, Any] = {}
+    if SESSION_FILE_PATH.is_file():
+        try:
+            parsed = json.loads(SESSION_FILE_PATH.read_text(encoding="utf-8"))
+            if isinstance(parsed, dict):
+                saved_state = parsed
+        except (OSError, json.JSONDecodeError):
+            saved_state = {}
+
+    if saved_state.get("logged_out") is True:
+        return None
+
+    candidate_uid = ""
+    fallback_user: dict[str, Any] | None = None
+    if saved_state.get("active") and isinstance(saved_state.get("uid"), str):
+        candidate_uid = saved_state["uid"].strip()
+        if isinstance(saved_state.get("user"), dict):
+            fallback_user = saved_state["user"]
+
+    if not candidate_uid:
+        try:
+            qp_uid = str(st.query_params.get("u", "")).strip()
+            if qp_uid:
+                candidate_uid = qp_uid
+        except Exception:
+            pass
+
+    if candidate_uid:
+        try:
+            snap = db.collection("users").document(candidate_uid).get()
+            if snap.exists:
+                user_obj = _build_user_dict_from_snapshot(
+                    candidate_uid, snap.to_dict() or {}, fallback_user
+                )
+                st.session_state["user"] = user_obj
+                save_persistent_session(user_obj)
+                return user_obj
+        except Exception:
+            pass
+        if fallback_user and fallback_user.get("uid"):
+            st.session_state["user"] = fallback_user
+            save_persistent_session(fallback_user)
+            return fallback_user
+
+    # Se ainda não existe arquivo de sessão (ex.: primeiro reload antes de salvar sessão),
+    # reconecta automaticamente a conta existente no banco para não deslogar.
+    if not saved_state:
+        try:
+            snapshots = list(db.collection("users").stream())
+            if snapshots:
+                best_snap = max(
+                    snapshots,
+                    key=lambda s: str(
+                        (s.to_dict() or {}).get("updated_at")
+                        or (s.to_dict() or {}).get("created_at")
+                        or ""
+                    ),
+                )
+                user_obj = _build_user_dict_from_snapshot(
+                    best_snap.id, best_snap.to_dict() or {}
+                )
+                st.session_state["user"] = user_obj
+                save_persistent_session(user_obj)
+                return user_obj
+        except Exception:
+            pass
+
+    return None
+
+
 def get_user_profile(db: Any, user: dict[str, Any]) -> dict[str, Any]:
     uid = str(user.get("uid", ""))
     if not uid:
@@ -421,6 +576,7 @@ def get_user_profile(db: Any, user: dict[str, Any]) -> dict[str, Any]:
                 if key in data and data[key] is not None:
                     merged[key] = data[key]
             st.session_state["user"] = merged
+            save_persistent_session(merged)
             return merged
     except Exception:
         pass
@@ -433,6 +589,7 @@ def save_user_profile(db: Any, uid: str, profile_updates: dict[str, Any]) -> Non
     db.collection("users").document(uid).set(payload, merge=True)
     if "user" in st.session_state and isinstance(st.session_state["user"], dict):
         st.session_state["user"].update(profile_updates)
+        save_persistent_session(st.session_state["user"])
 
 
 def process_uploaded_photo(uploaded_file: Any) -> str:
@@ -836,6 +993,7 @@ def render_authentication(db: firestore.Client) -> None:
                         st.error("Usuário ou senha incorretos.")
                     else:
                         st.session_state["user"] = user
+                        save_persistent_session(user)
                         st.session_state["page"] = "home"
                         st.rerun()
                 except ValueError as error:
@@ -872,8 +1030,14 @@ def render_authentication(db: firestore.Client) -> None:
                     validate_password(new_password)
                     password_hash = hash_password(new_password)
                     if register_user(db, username, password_hash, username):
-                        st.session_state["auth_mode"] = "login"
-                        st.session_state["auth_message"] = "Conta criada com sucesso! Faça seu login."
+                        user = authenticate_user(db, username, new_password)
+                        if user is not None:
+                            st.session_state["user"] = user
+                            save_persistent_session(user)
+                            st.session_state["page"] = "home"
+                        else:
+                            st.session_state["auth_mode"] = "login"
+                            st.session_state["auth_message"] = "Conta criada com sucesso! Faça seu login."
                         st.rerun()
                     else:
                         st.error("Esse usuário já está em uso.")
@@ -1103,17 +1267,27 @@ def _render_extra_income_tab(
 
     if month_extras:
         st.markdown("#### ⚡ Bicos e ganhos extras deste mês")
-        for extra in month_extras[:5]:
+        for extra in month_extras[:8]:
             desc = html.escape(str(extra.get("description", "Bico")))
             cat = html.escape(str(extra.get("category", "Bico")))
             day_str = date.fromisoformat(extra["date"]).strftime("%d/%m/%Y")
-            st.markdown(
-                f'<div class="extra-item-row">'
-                f'<div><strong>⚡ {desc}</strong><small>{cat} · {day_str}</small></div>'
-                f'<span class="extra-item-val">+ {money(int(extra["amount_cents"]))}</span>'
-                f'</div>',
-                unsafe_allow_html=True,
-            )
+            row_col, del_col = st.columns([5, 1.1], vertical_alignment="center")
+            with row_col:
+                st.markdown(
+                    f'<div class="extra-item-row">'
+                    f'<div><strong>⚡ {desc}</strong><small>{cat} · {day_str}</small></div>'
+                    f'<span class="extra-item-val">+ {money(int(extra["amount_cents"]))}</span>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+            with del_col:
+                if st.button("Excluir", key=f"del_extra_{extra['id']}", use_container_width=True):
+                    try:
+                        delete_transaction(db, user["uid"], extra["id"])
+                        st.session_state["saved_message"] = "Ganho extra excluído com sucesso."
+                        st.rerun()
+                    except (GoogleAPICallError, PermissionError, RuntimeError) as error:
+                        report_database_error("excluir o ganho extra", error)
 
 
 def render_income_tabs(db: Any, user: dict[str, Any]) -> None:
@@ -1416,6 +1590,8 @@ def generate_free_financial_ai_answer(
 ) -> str:
     q_lower = question.lower()
     expenses = [r for r in records if r.get("type") == "despesa"]
+    extras = [r for r in records if is_extra_income_record(r)]
+    extra_cents = sum(int(r.get("amount_cents", 0)) for r in extras)
     sorted_categories = sorted(category_totals.items(), key=lambda item: item[1], reverse=True)
     largest_expense = (
         max(expenses, key=lambda item: int(item.get("amount_cents", 0)))
@@ -1423,6 +1599,19 @@ def generate_free_financial_ai_answer(
         else None
     )
     committed_pct = (expense_cents / income_cents * 100) if income_cents > 0 else 0.0
+
+    # 0. Perguntas sobre bico / dinheiro extra
+    if any(term in q_lower for term in ("bico", "bicos", "extra", "extras", "freela", "comissão", "comissao")):
+        if not extras:
+            return (
+                "⚡ Você ainda não registrou nenhum **dinheiro extra / bico** neste mês. "
+                "Use a aba **⚡ Dinheiro Extra / Bico** no menu lateral para registrar seus ganhos extras."
+            )
+        return (
+            f"⚡ **Seus ganhos com Dinheiro Extra / Bicos neste mês:**\n\n"
+            f"- **Total ganho em bicos/extras:** **{money(extra_cents)}** em **{len(extras)}** lançamento(s).\n"
+            f"- **Renda total recebida no mês (Salário + Vale + Bicos):** **{money(income_cents)}**."
+        )
 
     # 1. Perguntas sobre maior gasto
     if any(term in q_lower for term in ("maior gasto", "maior despesa", "gastei mais", "onde mais gastei", "mais caro")):
@@ -2081,6 +2270,7 @@ def render_home(db: Any, user: dict[str, Any]) -> None:
 
 
 def logout() -> None:
+    clear_persistent_session()
     for key in list(st.session_state.keys()):
         st.session_state.pop(key, None)
 
@@ -3132,7 +3322,7 @@ def main() -> None:
         st.error(f"Configuração do Firebase inválida: {error}")
         st.stop()
 
-    user = st.session_state.get("user")
+    user = restore_persistent_session(db)
     if not user:
         render_authentication(db)
         return
