@@ -408,13 +408,48 @@ def authenticate_user(db: Any, username: str, password: str) -> dict[str, Any] |
     }
 
 
-SESSION_FILE_PATH = Path(__file__).resolve().parent / ".sessao_ativa.json"
+SESSIONS_FILE_PATH = Path(__file__).resolve().parent / ".sessoes_tokens.json"
+LEGACY_SESSION_FILE_PATH = Path(__file__).resolve().parent / ".sessao_ativa.json"
 
 
-def save_persistent_session(user: dict[str, Any]) -> None:
+def _load_sessions_map() -> dict[str, dict[str, Any]]:
+    if LEGACY_SESSION_FILE_PATH.is_file():
+        try:
+            LEGACY_SESSION_FILE_PATH.unlink()
+        except OSError:
+            pass
+    if not SESSIONS_FILE_PATH.is_file():
+        return {}
+    try:
+        parsed = json.loads(SESSIONS_FILE_PATH.read_text(encoding="utf-8"))
+        return parsed if isinstance(parsed, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _save_sessions_map(sessions_map: dict[str, dict[str, Any]]) -> None:
+    try:
+        SESSIONS_FILE_PATH.write_text(
+            json.dumps(_serialize_json_value(sessions_map), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
+def save_persistent_session(user: dict[str, Any], new_login: bool = False) -> None:
     uid = str(user.get("uid", "")).strip()
     if not uid:
         return
+    token = str(st.session_state.get("session_token") or "").strip()
+    if not token and not new_login:
+        try:
+            token = str(st.query_params.get("s", "")).strip()
+        except Exception:
+            token = ""
+    if not token or new_login:
+        token = secrets.token_urlsafe(24)
+
     safe_user = {
         "uid": uid,
         "username": str(user.get("username", "")),
@@ -425,46 +460,36 @@ def save_persistent_session(user: dict[str, Any]) -> None:
         "job_role": user.get("job_role", ""),
         "photo_data_url": user.get("photo_data_url", ""),
     }
+    sessions_map = _load_sessions_map()
+    sessions_map[token] = {
+        "uid": uid,
+        "username": safe_user["username"],
+        "user": safe_user,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    _save_sessions_map(sessions_map)
+    st.session_state["session_token"] = token
     try:
-        SESSION_FILE_PATH.write_text(
-            json.dumps(
-                {
-                    "active": True,
-                    "logged_out": False,
-                    "uid": uid,
-                    "user": _serialize_json_value(safe_user),
-                    "updated_at": datetime.now(timezone.utc).isoformat(),
-                },
-                ensure_ascii=False,
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
-    except OSError:
-        pass
-    try:
-        if st.query_params.get("u") != uid:
-            st.query_params["u"] = uid
+        if "u" in st.query_params:
+            del st.query_params["u"]
+        if st.query_params.get("s") != token:
+            st.query_params["s"] = token
     except Exception:
         pass
 
 
 def clear_persistent_session() -> None:
-    try:
-        SESSION_FILE_PATH.write_text(
-            json.dumps(
-                {
-                    "active": False,
-                    "logged_out": True,
-                    "updated_at": datetime.now(timezone.utc).isoformat(),
-                },
-                ensure_ascii=False,
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
-    except OSError:
-        pass
+    token = str(st.session_state.get("session_token") or "").strip()
+    if not token:
+        try:
+            token = str(st.query_params.get("s", "")).strip()
+        except Exception:
+            token = ""
+    if token:
+        sessions_map = _load_sessions_map()
+        if token in sessions_map:
+            del sessions_map[token]
+            _save_sessions_map(sessions_map)
     try:
         st.query_params.clear()
     except Exception:
@@ -488,77 +513,66 @@ def _build_user_dict_from_snapshot(uid: str, data: dict[str, Any], fallback: dic
 
 
 def restore_persistent_session(db: Any) -> dict[str, Any] | None:
-    current_user = st.session_state.get("user")
-    if isinstance(current_user, dict) and current_user.get("uid"):
-        save_persistent_session(current_user)
-        return current_user
-
-    saved_state: dict[str, Any] = {}
-    if SESSION_FILE_PATH.is_file():
+    if LEGACY_SESSION_FILE_PATH.is_file():
         try:
-            parsed = json.loads(SESSION_FILE_PATH.read_text(encoding="utf-8"))
-            if isinstance(parsed, dict):
-                saved_state = parsed
-        except (OSError, json.JSONDecodeError):
-            saved_state = {}
+            LEGACY_SESSION_FILE_PATH.unlink()
+        except OSError:
+            pass
 
-    if saved_state.get("logged_out") is True:
+    try:
+        if "u" in st.query_params:
+            del st.query_params["u"]
+        qp_token = str(st.query_params.get("s", "")).strip()
+    except Exception:
+        qp_token = ""
+
+    mem_token = str(st.session_state.get("session_token") or "").strip()
+    token = qp_token or mem_token
+    if not token:
+        st.session_state.pop("user", None)
+        st.session_state.pop("session_token", None)
         return None
 
-    candidate_uid = ""
-    fallback_user: dict[str, Any] | None = None
-    if saved_state.get("active") and isinstance(saved_state.get("uid"), str):
-        candidate_uid = saved_state["uid"].strip()
-        if isinstance(saved_state.get("user"), dict):
-            fallback_user = saved_state["user"]
-
-    if not candidate_uid:
+    sessions_map = _load_sessions_map()
+    entry = sessions_map.get(token)
+    if not isinstance(entry, dict) or not entry.get("uid"):
+        st.session_state.pop("user", None)
+        st.session_state.pop("session_token", None)
         try:
-            qp_uid = str(st.query_params.get("u", "")).strip()
-            if qp_uid:
-                candidate_uid = qp_uid
+            if "s" in st.query_params:
+                del st.query_params["s"]
         except Exception:
             pass
+        return None
 
-    if candidate_uid:
+    uid = str(entry["uid"]).strip()
+    fallback_user = entry.get("user") if isinstance(entry.get("user"), dict) else None
+
+    current_user = st.session_state.get("user")
+    if isinstance(current_user, dict) and current_user.get("uid") == uid and mem_token == token:
         try:
-            snap = db.collection("users").document(candidate_uid).get()
-            if snap.exists:
-                user_obj = _build_user_dict_from_snapshot(
-                    candidate_uid, snap.to_dict() or {}, fallback_user
-                )
-                st.session_state["user"] = user_obj
-                save_persistent_session(user_obj)
-                return user_obj
+            if st.query_params.get("s") != token:
+                st.query_params["s"] = token
         except Exception:
             pass
-        if fallback_user and fallback_user.get("uid"):
-            st.session_state["user"] = fallback_user
-            save_persistent_session(fallback_user)
-            return fallback_user
+        return current_user
 
-    # Se ainda não existe arquivo de sessão (ex.: primeiro reload antes de salvar sessão),
-    # reconecta automaticamente a conta existente no banco para não deslogar.
-    if not saved_state:
-        try:
-            snapshots = list(db.collection("users").stream())
-            if snapshots:
-                best_snap = max(
-                    snapshots,
-                    key=lambda s: str(
-                        (s.to_dict() or {}).get("updated_at")
-                        or (s.to_dict() or {}).get("created_at")
-                        or ""
-                    ),
-                )
-                user_obj = _build_user_dict_from_snapshot(
-                    best_snap.id, best_snap.to_dict() or {}
-                )
-                st.session_state["user"] = user_obj
-                save_persistent_session(user_obj)
-                return user_obj
-        except Exception:
-            pass
+    try:
+        snap = db.collection("users").document(uid).get()
+        if snap.exists:
+            user_obj = _build_user_dict_from_snapshot(uid, snap.to_dict() or {}, fallback_user)
+            st.session_state["user"] = user_obj
+            st.session_state["session_token"] = token
+            save_persistent_session(user_obj, new_login=False)
+            return user_obj
+    except Exception:
+        pass
+
+    if fallback_user and fallback_user.get("uid") == uid:
+        st.session_state["user"] = fallback_user
+        st.session_state["session_token"] = token
+        save_persistent_session(fallback_user, new_login=False)
+        return fallback_user
 
     return None
 
@@ -622,6 +636,8 @@ def list_transactions(db: Any, uid: str) -> list[dict[str, Any]]:
     records = []
     for snapshot in db.collection("transactions").where("owner_uid", "==", uid).stream():
         record = snapshot.to_dict() or {}
+        if record.get("owner_uid") != uid:
+            continue
         record["id"] = snapshot.id
         records.append(record)
     return sorted(
@@ -992,8 +1008,10 @@ def render_authentication(db: firestore.Client) -> None:
                     if user is None:
                         st.error("Usuário ou senha incorretos.")
                     else:
+                        for key in list(st.session_state.keys()):
+                            st.session_state.pop(key, None)
                         st.session_state["user"] = user
-                        save_persistent_session(user)
+                        save_persistent_session(user, new_login=True)
                         st.session_state["page"] = "home"
                         st.rerun()
                 except ValueError as error:
@@ -1032,8 +1050,10 @@ def render_authentication(db: firestore.Client) -> None:
                     if register_user(db, username, password_hash, username):
                         user = authenticate_user(db, username, new_password)
                         if user is not None:
+                            for key in list(st.session_state.keys()):
+                                st.session_state.pop(key, None)
                             st.session_state["user"] = user
-                            save_persistent_session(user)
+                            save_persistent_session(user, new_login=True)
                             st.session_state["page"] = "home"
                         else:
                             st.session_state["auth_mode"] = "login"
@@ -1814,6 +1834,7 @@ def answer_financial_ai_question(
 def render_sidebar(db: Any, user: dict[str, Any]) -> dict[str, Any]:
     profile = get_user_profile(db, user)
     display_name = str(profile.get("display_name") or profile.get("username") or "Usuário")
+    username_str = str(profile.get("username") or "")
     photo_url = str(profile.get("photo_data_url") or "")
     workplace = str(profile.get("workplace") or "")
     job_role = str(profile.get("job_role") or "")
@@ -1826,6 +1847,8 @@ def render_sidebar(db: Any, user: dict[str, Any]) -> dict[str, Any]:
         else f'<span class="profile-avatar sidebar-top-avatar">{html.escape(display_name[:1].upper())}</span>'
     )
     sub_lines = []
+    if username_str:
+        sub_lines.append(f'<span class="sidebar-profile-meta">🔑 Conta: @{html.escape(username_str)}</span>')
     if workplace or job_role:
         work_str = " · ".join(p for p in (job_role, workplace) if p)
         sub_lines.append(f'<span class="sidebar-profile-meta">🏢 {html.escape(work_str)}</span>')
@@ -1836,8 +1859,6 @@ def render_sidebar(db: Any, user: dict[str, Any]) -> dict[str, Any]:
         meta_parts.append(html.escape(gender))
     if meta_parts:
         sub_lines.append(f'<span class="sidebar-profile-meta">👤 {" · ".join(meta_parts)}</span>')
-    if not sub_lines:
-        sub_lines.append('<span class="sidebar-profile-meta">Conta pessoal · Clique abaixo para editar</span>')
 
     st.sidebar.markdown(
         f'<div class="sidebar-brand"><span class="sidebar-brand-mark">✓</span>'
@@ -1888,6 +1909,9 @@ def render_sidebar(db: Any, user: dict[str, Any]) -> dict[str, Any]:
         st.session_state["page"] = "home"
         st.session_state["show_gestao"] = False
         st.session_state["show_reports"] = True
+        st.rerun()
+    if st.sidebar.button("🚪  Trocar de conta / Sair", key="sb_logout", use_container_width=True):
+        logout()
         st.rerun()
     return profile
 
