@@ -5,6 +5,7 @@ import calendar
 import hashlib
 import html
 import importlib
+import inspect
 import io
 import json
 import logging
@@ -16,13 +17,20 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
+import altair as alt
 import firebase_admin
+import pandas as pd
 import streamlit as st
 from firebase_admin import credentials, firestore
 from google.api_core.exceptions import GoogleAPICallError
-from google import genai
-from google.genai import errors, types
 from streamlit.errors import StreamlitSecretNotFoundError
+
+try:
+    from google import genai
+    from google.genai import types
+except ImportError:
+    genai = None  # type: ignore[assignment]
+    types = None  # type: ignore[assignment]
 
 
 LOGGER = logging.getLogger(__name__)
@@ -1374,14 +1382,14 @@ def render_profile_page(db: Any, user: dict[str, Any]) -> None:
     current_gender = str(profile.get("gender") or "Não informado")
     current_workplace = str(profile.get("workplace") or "")
     current_role = str(profile.get("job_role") or "")
-    photo_url = str(profile.get("photo_data_url") or "")
+    photo_url = str(profile.get("photo_data_url") or "").strip()
 
     st.subheader("👤 Meu Perfil")
     if st.session_state.get("saved_message"):
         st.success(st.session_state.pop("saved_message"))
 
     avatar_html = (
-        f'<img src="{photo_url}" class="profile-page-photo" alt="Foto de perfil">'
+        f'<img src="{html.escape(photo_url, quote=True)}" class="profile-page-photo" alt="Foto de perfil">'
         if photo_url
         else f'<div class="profile-page-avatar">{html.escape(display_name[:1].upper())}</div>'
     )
@@ -1611,6 +1619,7 @@ def render_transaction_form(
                         merge=True,
                     )
             save_transaction(db, user["uid"], transaction["id"] if is_editing else None, transaction_data)
+            st.session_state["selected_month"] = transaction_date.strftime("%Y-%m")
             st.session_state["page"] = "home"
             st.session_state["saved_message"] = (
                 "Receita salva com sucesso." if transaction_type == "receita" else "Gasto registrado com sucesso."
@@ -1800,7 +1809,7 @@ def answer_financial_ai_question(
         gemini_config = {}
     api_key = api_key or str(gemini_config.get("api_key", "")).strip()
 
-    if not api_key or api_key == "SUA_CHAVE_API":
+    if not api_key or api_key == "SUA_CHAVE_API" or genai is None or types is None:
         return generate_free_financial_ai_answer(
             clean_question,
             records,
@@ -1859,14 +1868,14 @@ def render_sidebar(db: Any, user: dict[str, Any]) -> dict[str, Any]:
     profile = get_user_profile(db, user)
     display_name = str(profile.get("display_name") or profile.get("username") or "Usuário")
     username_str = str(profile.get("username") or "")
-    photo_url = str(profile.get("photo_data_url") or "")
+    photo_url = str(profile.get("photo_data_url") or "").strip()
     workplace = str(profile.get("workplace") or "")
     job_role = str(profile.get("job_role") or "")
     age = str(profile.get("age") or "")
     gender = str(profile.get("gender") or "")
 
     avatar_markup = (
-        f'<img src="{photo_url}" class="sidebar-top-photo" alt="Foto">'
+        f'<img src="{html.escape(photo_url, quote=True)}" class="sidebar-top-photo" alt="Foto">'
         if photo_url
         else f'<span class="profile-avatar sidebar-top-avatar">{html.escape(display_name[:1].upper())}</span>'
     )
@@ -1940,6 +1949,272 @@ def render_sidebar(db: Any, user: dict[str, Any]) -> dict[str, Any]:
     return profile
 
 
+SHORT_MONTH_NAMES_PT = (
+    "Jan", "Fev", "Mar", "Abr", "Mai", "Jun",
+    "Jul", "Ago", "Set", "Out", "Nov", "Dez",
+)
+
+
+def short_month_pt(month_key: str, include_year: bool = False) -> str:
+    year_str, month_str = month_key.split("-")
+    label = SHORT_MONTH_NAMES_PT[int(month_str) - 1]
+    return f"{label}/{year_str[-2:]}" if include_year else label
+
+
+def format_day_month_pt(iso_date: str) -> str:
+    parsed = date.fromisoformat(iso_date)
+    return f"{parsed.day:02d} {SHORT_MONTH_NAMES_PT[parsed.month - 1]}"
+
+
+def render_altair_chart(chart: alt.TopLevelMixin) -> None:
+    params = inspect.signature(st.altair_chart).parameters
+    if "width" in params:
+        st.altair_chart(chart, width="stretch", theme=None)
+    else:
+        st.altair_chart(chart, use_container_width=True, theme=None)
+
+
+def build_financial_overview_chart(
+    records: list[dict[str, Any]],
+    selected_month: str,
+    current_month: str,
+    today_iso: str,
+) -> alt.TopLevelMixin:
+    max_month = max(current_month, selected_month)
+    all_months = sorted(
+        {
+            item["date"][:7]
+            for item in records
+            if isinstance(item.get("date"), str)
+            and len(item["date"]) >= 7
+            and item["date"][:7] <= max_month
+        }
+    )
+    if selected_month not in all_months:
+        all_months.append(selected_month)
+        all_months.sort()
+    month_keys = all_months[-6:]
+    if selected_month not in month_keys:
+        month_keys = sorted({*month_keys[-5:], selected_month})
+
+    multi_year = len({mk[:4] for mk in month_keys}) > 1
+    month_labels: list[str] = []
+    rows: list[dict[str, Any]] = []
+
+    for month_key in month_keys:
+        m_label = short_month_pt(month_key, include_year=multi_year)
+        month_labels.append(m_label)
+        month_records = [item for item in records if str(item.get("date", "")).startswith(month_key)]
+        income_cents = sum(
+            int(item.get("amount_cents", 0))
+            for item in month_records
+            if item.get("type") == "receita"
+            and (month_key != current_month or str(item.get("date", "")) <= today_iso)
+        )
+        expense_cents = sum(
+            int(item.get("amount_cents", 0))
+            for item in month_records
+            if item.get("type") == "despesa"
+        )
+        rows.append(
+            {
+                "Mês": m_label,
+                "Tipo": "Receitas",
+                "Valor": income_cents / 100,
+                "ValorTexto": money(income_cents),
+            }
+        )
+        rows.append(
+            {
+                "Mês": m_label,
+                "Tipo": "Despesas",
+                "Valor": expense_cents / 100,
+                "ValorTexto": money(expense_cents),
+            }
+        )
+
+    df = pd.DataFrame(rows)
+    max_val = float(df["Valor"].max()) if not df.empty else 0.0
+    y_upper = max(max_val * 1.26, 100.0)
+    color_scale = alt.Scale(domain=["Receitas", "Despesas"], range=["#10B981", "#F43F5E"])
+
+    if len(month_keys) == 1:
+        period_title = month_label(month_keys[0])
+        base = alt.Chart(df).encode(
+            x=alt.X(
+                "Tipo:N",
+                sort=["Receitas", "Despesas"],
+                title=period_title,
+                axis=alt.Axis(labelAngle=0, labelFontWeight="bold", titlePadding=10),
+            ),
+            y=alt.Y(
+                "Valor:Q",
+                title="Valor (R$)",
+                scale=alt.Scale(domain=[0, y_upper]),
+                axis=alt.Axis(tickCount=5),
+            ),
+        )
+        bars = base.mark_bar(
+            size=76,
+            cornerRadiusTopLeft=12,
+            cornerRadiusTopRight=12,
+        ).encode(
+            color=alt.Color("Tipo:N", scale=color_scale, legend=None),
+            tooltip=[
+                alt.Tooltip("Tipo:N", title="Tipo"),
+                alt.Tooltip("ValorTexto:N", title="Valor"),
+            ],
+        )
+        labels = base.mark_text(
+            dy=-10,
+            fontWeight="bold",
+            fontSize=13,
+            color="#0F172A",
+            font="Plus Jakarta Sans, Inter, sans-serif",
+        ).encode(text="ValorTexto:N")
+        chart: alt.TopLevelMixin = (bars + labels).properties(
+            height=295,
+            background="#FFFFFF",
+            padding={"left": 6, "right": 12, "top": 14, "bottom": 6},
+        )
+    else:
+        chart = (
+            alt.Chart(df)
+            .mark_bar(cornerRadiusTopLeft=8, cornerRadiusTopRight=8)
+            .encode(
+                x=alt.X(
+                    "Mês:N",
+                    sort=month_labels,
+                    title=None,
+                    axis=alt.Axis(labelAngle=0, labelFontWeight="bold"),
+                ),
+                xOffset=alt.XOffset("Tipo:N", sort=["Receitas", "Despesas"]),
+                y=alt.Y(
+                    "Valor:Q",
+                    title="Valor (R$)",
+                    scale=alt.Scale(domain=[0, y_upper]),
+                    axis=alt.Axis(tickCount=5),
+                ),
+                color=alt.Color(
+                    "Tipo:N",
+                    scale=color_scale,
+                    legend=alt.Legend(
+                        orient="bottom",
+                        direction="horizontal",
+                        title=None,
+                        symbolType="circle",
+                        symbolSize=100,
+                        offset=10,
+                    ),
+                ),
+                tooltip=[
+                    alt.Tooltip("Mês:N", title="Mês"),
+                    alt.Tooltip("Tipo:N", title="Tipo"),
+                    alt.Tooltip("ValorTexto:N", title="Valor"),
+                ],
+            )
+            .properties(
+                height=295,
+                background="#FFFFFF",
+                padding={"left": 6, "right": 12, "top": 12, "bottom": 6},
+            )
+        )
+
+    return (
+        chart.configure_view(strokeWidth=0, fill="#FFFFFF")
+        .configure_axis(
+            labelColor="#475569",
+            titleColor="#334155",
+            gridColor="#E2E8F0",
+            gridDash=[3, 3],
+            domainColor="#CBD5E1",
+            tickColor="#CBD5E1",
+            labelFont="Inter, sans-serif",
+            titleFont="Inter, sans-serif",
+            labelFontSize=12,
+            titleFontSize=12,
+        )
+        .configure_legend(
+            labelColor="#334155",
+            labelFont="Inter, sans-serif",
+            labelFontSize=12,
+        )
+    )
+
+
+def build_category_expense_chart(expense_categories_cents: dict[str, int]) -> alt.TopLevelMixin:
+    sorted_items = sorted(expense_categories_cents.items(), key=lambda pair: pair[1], reverse=True)
+    df = pd.DataFrame(
+        [
+            {
+                "Categoria": cat,
+                "Valor": cents / 100,
+                "ValorTexto": money(cents),
+            }
+            for cat, cents in sorted_items
+        ]
+    )
+    max_val = float(df["Valor"].max()) if not df.empty else 0.0
+    x_upper = max(max_val * 1.32, 100.0)
+    chart_height = max(180, len(sorted_items) * 44 + 44)
+
+    base = alt.Chart(df).encode(
+        y=alt.Y(
+            "Categoria:N",
+            sort="-x",
+            title=None,
+            axis=alt.Axis(labelLimit=160, labelFontWeight="bold"),
+        ),
+        x=alt.X(
+            "Valor:Q",
+            title="Gastos (R$)",
+            scale=alt.Scale(domain=[0, x_upper]),
+            axis=alt.Axis(tickCount=4),
+        ),
+    )
+    bars = base.mark_bar(
+        size=24,
+        cornerRadiusTopRight=8,
+        cornerRadiusBottomRight=8,
+        color="#F43F5E",
+    ).encode(
+        tooltip=[
+            alt.Tooltip("Categoria:N", title="Categoria"),
+            alt.Tooltip("ValorTexto:N", title="Total gasto"),
+        ]
+    )
+    labels = base.mark_text(
+        align="left",
+        dx=8,
+        fontWeight="bold",
+        fontSize=12,
+        color="#0F172A",
+        font="Plus Jakarta Sans, Inter, sans-serif",
+    ).encode(text="ValorTexto:N")
+
+    return (
+        (bars + labels)
+        .properties(
+            height=chart_height,
+            background="#FFFFFF",
+            padding={"left": 6, "right": 18, "top": 10, "bottom": 6},
+        )
+        .configure_view(strokeWidth=0, fill="#FFFFFF")
+        .configure_axis(
+            labelColor="#475569",
+            titleColor="#334155",
+            gridColor="#E2E8F0",
+            gridDash=[3, 3],
+            domainColor="#CBD5E1",
+            tickColor="#CBD5E1",
+            labelFont="Inter, sans-serif",
+            titleFont="Inter, sans-serif",
+            labelFontSize=12,
+            titleFontSize=12,
+        )
+    )
+
+
 def render_home(db: Any, user: dict[str, Any]) -> None:
     try:
         records = list_transactions(db, user["uid"])
@@ -1962,7 +2237,7 @@ def render_home(db: Any, user: dict[str, Any]) -> None:
     display_name = user.get("display_name") or user.get("username")
     workplace = str(user.get("workplace") or "")
     job_role = str(user.get("job_role") or "")
-    photo_url = str(user.get("photo_data_url") or "")
+    photo_url = str(user.get("photo_data_url") or "").strip()
 
     if st.session_state.get("saved_message"):
         st.success(st.session_state.pop("saved_message"))
@@ -1976,7 +2251,7 @@ def render_home(db: Any, user: dict[str, Any]) -> None:
         else ""
     )
     header_avatar = (
-        f'<img src="{photo_url}" class="welcome-avatar-img" alt="Foto">'
+        f'<img src="{html.escape(photo_url, quote=True)}" class="welcome-avatar-img" alt="Foto">'
         if photo_url
         else f'<div class="welcome-avatar-fallback">{html.escape(str(display_name)[:1].upper())}</div>'
     )
@@ -1993,6 +2268,7 @@ def render_home(db: Any, user: dict[str, Any]) -> None:
             unsafe_allow_html=True,
         )
     with month_col:
+        st.markdown('<div class="month-select-label">PERÍODO</div>', unsafe_allow_html=True)
         selected_month = st.selectbox(
             "Mês de referência",
             month_options,
@@ -2006,7 +2282,8 @@ def render_home(db: Any, user: dict[str, Any]) -> None:
     received_incomes = [
         item
         for item in displayed_records
-        if item["type"] == "receita" and str(item.get("date", "")) <= today_iso
+        if item["type"] == "receita"
+        and (selected_month != current_month or str(item.get("date", "")) <= today_iso)
     ]
     extra_incomes = [item for item in received_incomes if is_extra_income_record(item)]
     salary_vale_total = sum(
@@ -2018,7 +2295,33 @@ def render_home(db: Any, user: dict[str, Any]) -> None:
         item["amount_cents"] for item in displayed_records if item["type"] == "despesa"
     )
     balance = income_total - expense_total
-    committed_share = min(expense_total / income_total, 1.0) if income_total else 0.0
+    raw_committed_share = (expense_total / income_total) if income_total > 0 else 0.0
+    bar_committed_share = (
+        min(raw_committed_share, 1.0)
+        if income_total > 0
+        else (1.0 if expense_total > 0 else 0.0)
+    )
+    if income_total == 0 and expense_total > 0:
+        expense_note_text = "Sem renda recebida no mês"
+        commitment_pct_text = "—"
+        commitment_badge = ("Sem renda", "warn")
+        progress_tone = "danger"
+    elif raw_committed_share >= 0.9:
+        expense_note_text = f"{raw_committed_share:.0%} da renda utilizada"
+        commitment_pct_text = f"{raw_committed_share:.0%}"
+        commitment_badge = ("Acima do ideal", "danger")
+        progress_tone = "danger"
+    elif raw_committed_share >= 0.7:
+        expense_note_text = f"{raw_committed_share:.0%} da renda utilizada"
+        commitment_pct_text = f"{raw_committed_share:.0%}"
+        commitment_badge = ("Atenção", "warn")
+        progress_tone = "warn"
+    else:
+        expense_note_text = f"{raw_committed_share:.0%} da renda utilizada"
+        commitment_pct_text = f"{raw_committed_share:.0%}"
+        commitment_badge = ("Controlado", "ok")
+        progress_tone = "ok"
+
     recurring_notes = []
     sel_year, sel_m = map(int, selected_month.split("-"))
     for kind, label_name in (("salary", "Salário"), ("vale", "Vale")):
@@ -2035,7 +2338,7 @@ def render_home(db: Any, user: dict[str, Any]) -> None:
     income_note_text = (
         " · ".join(recurring_notes)
         if recurring_notes
-        else f"✓ &nbsp; Recebido em {html.escape(period_label)}"
+        else f"✓ Recebido em {html.escape(period_label)}"
     )
     extra_note_text = (
         f"⚡ {len(extra_incomes)} ganho(s) extra / bico(s) no mês"
@@ -2049,10 +2352,11 @@ def render_home(db: Any, user: dict[str, Any]) -> None:
         if balance < 0
         else "Saldo zerado no momento"
     )
+    balance_card_modifier = " metric-balance-negative" if balance < 0 else ""
     st.markdown(
         f'<div class="metrics-row metrics-row-4">'
         f'<div class="metric-card metric-income">'
-        f'<div class="metric-top"><div class="metric-label">Salário e Vale recebidos</div><span class="metric-icon-badge">💰</span></div>'
+        f'<div class="metric-top"><div class="metric-label">Salário e Vale</div><span class="metric-icon-badge">💰</span></div>'
         f'<div class="metric-val">{money(salary_vale_total)}</div>'
         f'<div class="metric-note">{income_note_text}</div></div>'
         f'<div class="metric-card metric-extra">'
@@ -2062,9 +2366,9 @@ def render_home(db: Any, user: dict[str, Any]) -> None:
         f'<div class="metric-card metric-expense">'
         f'<div class="metric-top"><div class="metric-label">Despesas do mês</div><span class="metric-icon-badge">📉</span></div>'
         f'<div class="metric-val">{money(expense_total)}</div>'
-        f'<div class="metric-note">{committed_share:.0%} da renda utilizada</div>'
-        f'<div class="metric-progress"><span style="width:{committed_share:.0%}"></span></div></div>'
-        f'<div class="metric-card metric-balance">'
+        f'<div class="metric-note">{expense_note_text}</div>'
+        f'<div class="metric-progress metric-progress-{progress_tone}"><span style="width:{bar_committed_share:.0%}"></span></div></div>'
+        f'<div class="metric-card metric-balance{balance_card_modifier}">'
         f'<div class="metric-top"><div class="metric-label">Saldo disponível</div><span class="metric-icon-badge">🏦</span></div>'
         f'<div class="metric-val">{money(balance)}</div>'
         f'<div class="metric-note">{balance_status_note}</div></div>'
@@ -2072,71 +2376,68 @@ def render_home(db: Any, user: dict[str, Any]) -> None:
         unsafe_allow_html=True,
     )
 
+    expense_categories_cents: dict[str, int] = {}
+    for item in displayed_records:
+        if item["type"] == "despesa":
+            category = str(item.get("category", "Sem categoria"))
+            expense_categories_cents[category] = (
+                expense_categories_cents.get(category, 0) + int(item["amount_cents"])
+            )
+
     chart_col, actions_col = st.columns([1.9, 1], gap="medium")
     with chart_col:
         st.markdown(
-            '<div class="section-heading"><div><h2>Visão financeira</h2>'
-            '<p>Acompanhe a evolução do seu dinheiro</p></div></div>',
+            f'<div class="section-heading"><div><h2>Visão financeira</h2>'
+            f'<p>Comparativo entre receitas e despesas ({html.escape(period_label)})</p></div>'
+            f'<div class="chart-legend-pills">'
+            f'<span class="legend-pill legend-income"><i></i>Receitas</span>'
+            f'<span class="legend-pill legend-expense"><i></i>Despesas</span>'
+            f'</div></div>',
             unsafe_allow_html=True,
         )
-        month_keys = sorted(
-            {
-                item["date"][:7]
-                for item in records
-                if isinstance(item.get("date"), str)
-                and item["date"][:7] <= current_month
-            }
-        )[-6:]
-        if not month_keys:
-            month_keys = [current_month]
-        chart_data = []
-        for month_key in month_keys:
-            month_records = [item for item in records if item["date"].startswith(month_key)]
-            chart_data.append(
-                {
-                    "Mês": month_label(month_key)[:3],
-                    "Salário": sum(
-                        item["amount_cents"]
-                        for item in month_records
-                        if item["type"] == "receita" and str(item.get("date", "")) <= today_iso
-                    ) / 100,
-                    "Despesas": sum(
-                        item["amount_cents"] for item in month_records if item["type"] == "despesa"
-                    ) / 100,
-                }
-            )
-        st.line_chart(
-            chart_data,
-            x="Mês",
-            y=["Salário", "Despesas"],
-            color=["#21B985", "#E79070"],
-            height=280,
+        overview_chart = build_financial_overview_chart(
+            records, selected_month, current_month, today_iso
         )
+        render_altair_chart(overview_chart)
+
         if st.session_state.get("show_reports"):
-            expense_categories: dict[str, float] = {}
-            for item in displayed_records:
-                if item["type"] == "despesa":
-                    category = str(item.get("category", "Sem categoria"))
-                    expense_categories[category] = (
-                        expense_categories.get(category, 0) + item["amount_cents"] / 100
-                    )
             st.markdown(
                 '<div class="section-heading"><div><h2>Despesas por categoria</h2>'
                 '<p>Distribuição dos gastos no mês selecionado</p></div></div>',
                 unsafe_allow_html=True,
             )
-            if expense_categories:
-                st.bar_chart(
-                    {
-                        "Categoria": list(expense_categories),
-                        "Gastos (R$)": list(expense_categories.values()),
-                    },
-                    x="Categoria",
-                    y="Gastos (R$)",
-                    height=220,
-                )
+            if expense_categories_cents:
+                render_altair_chart(build_category_expense_chart(expense_categories_cents))
             else:
                 st.info("Ainda não há despesas para este mês.")
+        elif expense_categories_cents:
+            top_categories = sorted(
+                expense_categories_cents.items(), key=lambda pair: pair[1], reverse=True
+            )[:4]
+            cat_colors = ("#F43F5E", "#F97316", "#8B5CF6", "#0EA5E9")
+            cat_rows_html = []
+            for idx, (cat_name, cat_cents) in enumerate(top_categories):
+                share = (cat_cents / expense_total) if expense_total > 0 else 0.0
+                bar_color = cat_colors[idx % len(cat_colors)]
+                cat_rows_html.append(
+                    f'<div class="cat-mini-row">'
+                    f'<div class="cat-mini-head">'
+                    f'<span class="cat-mini-name"><i style="background:{bar_color}"></i>{html.escape(cat_name)}</span>'
+                    f'<span class="cat-mini-val">{money(cat_cents)} <small>({share:.0%})</small></span>'
+                    f'</div>'
+                    f'<div class="cat-mini-track"><span style="width:{min(share, 1.0):.0%};background:{bar_color}"></span></div>'
+                    f'</div>'
+                )
+            st.markdown(
+                f'<div class="cat-summary-card">'
+                f'<div class="cat-summary-header">'
+                f'<strong>Onde foi seu dinheiro</strong>'
+                f'<span>{len(expense_categories_cents)} categoria(s)</span>'
+                f'</div>'
+                f'{"".join(cat_rows_html)}'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
 
     with actions_col:
         st.markdown(
@@ -2164,9 +2465,13 @@ def render_home(db: Any, user: dict[str, Any]) -> None:
             st.session_state["page"] = "profile"
             st.rerun()
         st.markdown(
-            f'<div class="commitment-card"><div class="commitment-title">Renda comprometida'
-            f'<strong>{committed_share:.0%}</strong></div>'
-            f'<div class="metric-progress"><span style="width:{committed_share:.0%}"></span></div>'
+            f'<div class="commitment-card">'
+            f'<div class="commitment-top">'
+            f'<span class="commitment-label">Renda comprometida</span>'
+            f'<span class="commitment-badge commitment-badge-{commitment_badge[1]}">{commitment_badge[0]}</span>'
+            f'</div>'
+            f'<div class="commitment-value">{commitment_pct_text}</div>'
+            f'<div class="metric-progress metric-progress-{progress_tone}"><span style="width:{bar_committed_share:.0%}"></span></div>'
             f'<small>{money(expense_total)} de {money(income_total)} recebidos no mês</small></div>',
             unsafe_allow_html=True,
         )
@@ -2184,52 +2489,61 @@ def render_home(db: Any, user: dict[str, Any]) -> None:
             is_income = record["type"] == "receita"
             sign = "+" if is_income else "−"
             amount_class = "income" if is_income else "expense"
-            icon = "＋" if is_income else "−"
+            icon = "↗" if is_income else "↘"
             description = html.escape(str(record.get("description", "Lançamento")))
             category = html.escape(str(record.get("category", "Sem categoria")))
-            transaction_day = date.fromisoformat(record["date"]).strftime("%d %b")
-            with st.container():
-                record_cols = st.columns([0.55, 4.5, 1.7, 1.1, 0.85, 0.85], vertical_alignment="center")
+            transaction_day = format_day_month_pt(record["date"])
+            is_confirming = st.session_state.get("delete_transaction_id") == record["id"]
+
+            row_card_html = (
+                f'<div class="record-row-card">'
+                f'<div class="record-row-left">'
+                f'<div class="record-icon {amount_class}">{icon}</div>'
+                f'<div class="record-description">'
+                f'<strong>{description}</strong>'
+                f'<div class="record-meta">'
+                f'<span class="record-cat-pill">{category}</span>'
+                f'<span class="record-date-text">{transaction_day}</span>'
+                f'</div></div></div>'
+                f'<div class="record-amount {amount_class}">{sign} {money(record["amount_cents"])}</div>'
+                f'</div>'
+            )
+
+            if is_confirming:
+                record_cols = st.columns([4.3, 1.1, 1.4, 1.2], vertical_alignment="center")
                 with record_cols[0]:
-                    st.markdown(
-                        f'<div class="record-icon {amount_class}">{icon}</div>',
-                        unsafe_allow_html=True,
-                    )
+                    st.markdown(row_card_html, unsafe_allow_html=True)
                 with record_cols[1]:
-                    st.markdown(
-                        f'<div class="record-description"><strong>{description}</strong>'
-                        f'<small>{category} · {transaction_day}</small></div>',
-                        unsafe_allow_html=True,
-                    )
-                with record_cols[2]:
-                    st.markdown(
-                        f'<div class="record-amount {amount_class}">{sign} {money(record["amount_cents"])}</div>',
-                        unsafe_allow_html=True,
-                    )
-                with record_cols[3]:
                     if st.button("Editar", key=f"edit_{record['id']}", use_container_width=True):
                         st.session_state["editing_transaction"] = record
                         st.session_state["page"] = "edit"
                         st.rerun()
-                with record_cols[4]:
-                    delete_key = f"del_{record['id']}"
-                    if st.session_state.get("delete_transaction_id") == record["id"]:
-                        if st.button("Confirmar", key=f"confirm_{record['id']}", use_container_width=True):
-                            try:
-                                delete_transaction(db, user["uid"], record["id"])
-                                st.session_state.pop("delete_transaction_id", None)
-                                st.success("Lançamento excluído com sucesso.")
-                                st.rerun()
-                            except (GoogleAPICallError, PermissionError, RuntimeError) as error:
-                                report_database_error("excluir o lançamento", error)
-                    elif st.button("Excluir", key=delete_key, use_container_width=True):
+                with record_cols[2]:
+                    if st.button("Confirmar", key=f"confirm_{record['id']}", use_container_width=True):
+                        try:
+                            delete_transaction(db, user["uid"], record["id"])
+                            st.session_state.pop("delete_transaction_id", None)
+                            st.success("Lançamento excluído com sucesso.")
+                            st.rerun()
+                        except (GoogleAPICallError, PermissionError, RuntimeError) as error:
+                            report_database_error("excluir o lançamento", error)
+                with record_cols[3]:
+                    if st.button("Cancelar", key=f"cancel_{record['id']}", use_container_width=True):
+                        st.session_state.pop("delete_transaction_id", None)
+                        st.rerun()
+            else:
+                record_cols = st.columns([5.3, 1.15, 1.15], vertical_alignment="center")
+                with record_cols[0]:
+                    st.markdown(row_card_html, unsafe_allow_html=True)
+                with record_cols[1]:
+                    if st.button("Editar", key=f"edit_{record['id']}", use_container_width=True):
+                        st.session_state["editing_transaction"] = record
+                        st.session_state["page"] = "edit"
+                        st.rerun()
+                with record_cols[2]:
+                    if st.button("Excluir", key=f"del_{record['id']}", use_container_width=True):
                         st.session_state["delete_transaction_id"] = record["id"]
                         st.rerun()
-                with record_cols[5]:
-                    if st.session_state.get("delete_transaction_id") == record["id"]:
-                        if st.button("Cancelar", key=f"cancel_{record['id']}", use_container_width=True):
-                            st.session_state.pop("delete_transaction_id", None)
-                            st.rerun()
 
     if len(displayed_records) > 5:
         st.caption(f"Mostrando 5 de {len(displayed_records)} lançamentos. Use o menu Lançamentos para gerenciar todos.")
@@ -2358,26 +2672,42 @@ def main() -> None:
         <style>
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=Plus+Jakarta+Sans:wght@600;700;800&display=swap');
 
-        :root { color-scheme: light; }
+        :root {
+            color-scheme: light;
+            --nf-bg: #f4f7fb;
+            --nf-surface: #ffffff;
+            --nf-border: rgba(15, 23, 42, 0.08);
+            --nf-text: #0f172a;
+            --nf-muted: #64748b;
+            --nf-emerald: #10b981;
+            --nf-emerald-dark: #059669;
+            --nf-rose: #f43f5e;
+            --nf-amber: #f59e0b;
+            --nf-sky: #0284c7;
+        }
 
         /* ── App Background ── */
         .stApp {
             background:
-                radial-gradient(ellipse at 0% 0%, rgba(16, 185, 129, 0.13), transparent 38%),
-                radial-gradient(ellipse at 100% 0%, rgba(14, 165, 233, 0.11), transparent 36%),
-                radial-gradient(ellipse at 50% 100%, rgba(245, 158, 11, 0.06), transparent 40%),
-                #f1f5f9 !important;
+                radial-gradient(ellipse 65% 45% at 0% 0%, rgba(16, 185, 129, 0.13), transparent 55%),
+                radial-gradient(ellipse 55% 40% at 100% 0%, rgba(14, 165, 233, 0.11), transparent 55%),
+                radial-gradient(ellipse 50% 40% at 50% 100%, rgba(99, 102, 241, 0.06), transparent 55%),
+                var(--nf-bg) !important;
             font-family: 'Inter', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
-            color: #0f172a;
+            color: var(--nf-text);
+            -webkit-font-smoothing: antialiased;
         }
-        h1, h2, h3, .metric-val, .brand h1 {
+        h1, h2, h3, .metric-val, .brand h1, .commitment-value {
             font-family: 'Plus Jakarta Sans', 'Inter', sans-serif;
+        }
+        .metric-val, .record-amount, .cat-mini-val, .commitment-value, .extra-item-val {
+            font-variant-numeric: tabular-nums;
         }
 
         /* ── Main Container ── */
         .block-container {
-            max-width: 1480px;
-            padding: 1.75rem 2.2rem 5rem;
+            max-width: 1440px;
+            padding: 1.6rem 2.2rem 5rem;
         }
 
         /* ── Hide Streamlit branding ── */
@@ -2390,8 +2720,8 @@ def main() -> None:
         /* ── Sidebar ── */
         [data-testid="stSidebar"] {
             background: linear-gradient(180deg, #ffffff 0%, #f8fafc 100%) !important;
-            border-right: 1px solid #e2e8f0 !important;
-            box-shadow: 4px 0 24px rgba(15, 23, 42, 0.03);
+            border-right: 1px solid rgba(15, 23, 42, 0.07) !important;
+            box-shadow: 6px 0 30px rgba(15, 23, 42, 0.035);
         }
         [data-testid="stSidebar"] * {
             color: #475569;
@@ -2404,22 +2734,34 @@ def main() -> None:
         [data-testid="stSidebar"] div.stButton > button {
             text-align: left;
             background: #ffffff !important;
-            border: 1px solid #eef2f6 !important;
+            border: 1px solid rgba(15, 23, 42, 0.07) !important;
             color: #334155 !important;
-            border-radius: 14px !important;
-            min-height: 45px;
-            font-size: 0.88rem !important;
+            border-radius: 13px !important;
+            min-height: 44px;
+            font-size: 0.87rem !important;
             font-weight: 600 !important;
-            box-shadow: 0 2px 5px rgba(15, 23, 42, 0.02);
+            box-shadow: 0 1px 3px rgba(15, 23, 42, 0.03);
+            transition: all 0.18s cubic-bezier(0.4, 0, 0.2, 1) !important;
         }
         [data-testid="stSidebar"] div.stButton > button:hover {
-            background: #ecfdf5 !important;
-            border-color: #a7f3d0 !important;
+            background: linear-gradient(135deg, #ecfdf5 0%, #f0fdf4 100%) !important;
+            border-color: #6ee7b7 !important;
             color: #047857 !important;
             transform: translateX(3px) !important;
+            box-shadow: 0 4px 12px rgba(16, 185, 129, 0.10) !important;
+        }
+        .st-key-sb_expense button {
+            border-color: rgba(244, 63, 94, 0.18) !important;
+            color: #be123c !important;
+            background: #fffafb !important;
+        }
+        .st-key-sb_expense button:hover {
+            background: #fff1f2 !important;
+            border-color: #fda4af !important;
+            color: #9f1239 !important;
         }
         .st-key-sb_logout button {
-            margin-top: 0.6rem !important;
+            margin-top: 0.65rem !important;
             background: #fff1f2 !important;
             border-color: #fecdd3 !important;
             color: #be123c !important;
@@ -2433,24 +2775,25 @@ def main() -> None:
         /* ── Brand Title (Login) ── */
         .brand {
             text-align: center;
-            padding: 2rem 1rem 1.4rem;
-            max-width: 640px;
+            padding: 2.2rem 1rem 1.5rem;
+            max-width: 660px;
             margin: 0 auto;
         }
         .brand-badge {
             display: inline-flex;
             align-items: center;
             gap: 8px;
-            padding: 5px 14px;
-            margin-bottom: 0.9rem;
+            padding: 6px 15px;
+            margin-bottom: 1rem;
             border-radius: 99px;
             background: linear-gradient(135deg, #ecfdf5, #d1fae5);
             border: 1px solid #a7f3d0;
             color: #065f46;
-            font-size: 0.74rem;
+            font-size: 0.72rem;
             font-weight: 800;
-            letter-spacing: 0.06em;
+            letter-spacing: 0.08em;
             text-transform: uppercase;
+            box-shadow: 0 4px 14px rgba(16, 185, 129, 0.12);
         }
         .brand-badge span {
             display: inline-grid;
@@ -2464,16 +2807,16 @@ def main() -> None:
         }
         .brand h1 {
             margin: 0;
-            font-size: clamp(2.1rem, 4vw, 2.75rem);
-            font-weight: 900;
+            font-size: clamp(2.2rem, 4.2vw, 2.9rem);
+            font-weight: 800;
             letter-spacing: -0.045em;
-            background: linear-gradient(135deg, #064e3b 0%, #059669 55%, #0284c7 100%);
+            background: linear-gradient(135deg, #064e3b 0%, #059669 52%, #0284c7 100%);
             -webkit-background-clip: text;
             -webkit-text-fill-color: transparent;
             text-shadow: none;
         }
         .brand p {
-            margin: 0.55rem 0 1rem;
+            margin: 0.6rem 0 1.15rem;
             color: #475569;
             font-size: 1rem;
             font-weight: 500;
@@ -2488,65 +2831,23 @@ def main() -> None:
         .brand-pill {
             display: inline-flex;
             align-items: center;
-            padding: 5px 12px;
+            padding: 6px 13px;
             border-radius: 99px;
-            background: #ffffff;
-            border: 1px solid #e2e8f0;
+            background: rgba(255, 255, 255, 0.9);
+            border: 1px solid rgba(15, 23, 42, 0.08);
             color: #334155;
             font-size: 0.76rem;
             font-weight: 600;
-            box-shadow: 0 2px 6px rgba(15, 23, 42, 0.03);
+            box-shadow: 0 3px 10px rgba(15, 23, 42, 0.04);
+            backdrop-filter: blur(6px);
         }
 
-        /* ── Dashboard Heading ── */
-        .dashboard-heading {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            gap: 1rem;
-            padding: 1.1rem 1.25rem;
-            margin-bottom: 0.35rem;
-            border: 1px solid rgba(226,232,240,0.85);
-            border-radius: 20px;
-            background: linear-gradient(115deg, rgba(255,255,255,0.98), rgba(240,253,250,0.92));
-            box-shadow: 0 8px 24px rgba(15,23,42,0.045);
-        }
-        .dashboard-eyebrow {
-            margin-bottom: 0.35rem;
-            color: #059669;
-            font-size: 0.68rem;
-            font-weight: 800;
-            letter-spacing: 0.12em;
-        }
-        .dashboard-heading h1 {
-            margin: 0;
-            color: #102a24;
-            font-size: clamp(1.3rem, 2.4vw, 1.8rem);
-            font-weight: 800;
-            letter-spacing: -0.045em;
-        }
-        .dashboard-heading p {
-            margin: 0.28rem 0 0;
-            color: #64748b;
-            font-size: 0.86rem;
-        }
-        .dashboard-mark {
-            display: grid;
-            width: 54px;
-            height: 54px;
-            flex: 0 0 54px;
-            place-items: center;
-            border: 1px solid #d1fae5;
-            border-radius: 17px;
-            background: linear-gradient(145deg, #ecfdf5, #d1fae5);
-            font-size: 1.65rem;
-        }
-
+        /* ── Sidebar Brand & Profile ── */
         .sidebar-brand {
             display: flex;
             align-items: center;
             gap: 12px;
-            margin: 0.2rem 0 1.1rem;
+            margin: 0.15rem 0 1.05rem;
         }
         .sidebar-brand-mark {
             display: grid;
@@ -2554,11 +2855,11 @@ def main() -> None:
             height: 42px;
             place-items: center;
             border-radius: 14px;
-            background: linear-gradient(135deg, #064e3b 0%, #10b981 100%);
+            background: linear-gradient(135deg, #047857 0%, #10b981 100%);
             color: #ffffff !important;
-            font-size: 1.35rem;
+            font-size: 1.3rem;
             font-weight: 800;
-            box-shadow: 0 6px 16px rgba(16, 185, 129, 0.25);
+            box-shadow: 0 8px 18px rgba(16, 185, 129, 0.28);
         }
         .sidebar-brand strong, .sidebar-brand small,
         .sidebar-profile strong, .sidebar-profile small {
@@ -2566,57 +2867,83 @@ def main() -> None:
         }
         .sidebar-brand strong {
             color: #0f172a !important;
-            font-size: 1.12rem;
+            font-size: 1.14rem;
             font-weight: 800;
-            line-height: 1.15;
+            line-height: 1.1;
+            letter-spacing: -0.02em;
         }
         .sidebar-brand small {
             margin-top: 3px;
             color: #059669 !important;
             font-size: 0.6rem;
             font-weight: 800;
-            letter-spacing: 0.16em;
+            letter-spacing: 0.18em;
         }
         .sidebar-top-profile {
             display: flex;
             align-items: center;
             gap: 12px;
-            padding: 0.85rem 0.9rem;
-            margin: 0 0 0.55rem;
+            padding: 0.9rem 0.95rem;
+            margin: 0 0 0.6rem;
             border-radius: 18px;
-            background: linear-gradient(135deg, #0f2922 0%, #173a32 60%, #1e4d41 100%);
-            border: 1px solid rgba(52, 211, 153, 0.28);
-            box-shadow: 0 10px 24px rgba(15, 41, 34, 0.16);
+            background: linear-gradient(135deg, #06231d 0%, #0d3b31 58%, #0f5a47 100%);
+            border: 1px solid rgba(52, 211, 153, 0.25);
+            box-shadow: 0 12px 28px rgba(6, 35, 29, 0.18);
+            position: relative;
+            overflow: hidden;
+        }
+        .sidebar-top-profile::after {
+            content: '';
+            position: absolute;
+            top: -28px;
+            right: -28px;
+            width: 88px;
+            height: 88px;
+            border-radius: 50%;
+            background: radial-gradient(circle, rgba(52, 211, 153, 0.22), transparent 70%);
+            pointer-events: none;
         }
         .sidebar-top-photo {
-            width: 54px;
-            height: 54px;
-            flex: 0 0 54px;
-            border-radius: 50%;
-            object-fit: cover;
+            width: 54px !important;
+            height: 54px !important;
+            min-width: 54px !important;
+            max-width: 54px !important;
+            aspect-ratio: 1 / 1;
+            flex: 0 0 54px !important;
+            display: block !important;
+            border-radius: 50% !important;
+            object-fit: cover !important;
+            object-position: center !important;
             border: 2.5px solid #34d399;
-            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25);
+            box-shadow: 0 4px 14px rgba(0, 0, 0, 0.28);
+            position: relative;
+            z-index: 1;
         }
         .sidebar-top-avatar {
             width: 54px !important;
             height: 54px !important;
+            min-width: 54px !important;
             flex: 0 0 54px !important;
             font-size: 1.25rem !important;
             font-weight: 800 !important;
             background: linear-gradient(135deg, #10b981, #059669) !important;
             color: #ffffff !important;
             border: 2px solid rgba(255, 255, 255, 0.35);
+            position: relative;
+            z-index: 1;
         }
         .sidebar-top-info {
             min-width: 0;
             flex: 1;
+            position: relative;
+            z-index: 1;
         }
         .sidebar-top-info strong {
             display: block;
             color: #ffffff !important;
             font-size: 0.92rem;
             font-weight: 800;
-            line-height: 1.2;
+            line-height: 1.25;
             white-space: nowrap;
             overflow: hidden;
             text-overflow: ellipsis;
@@ -2633,34 +2960,22 @@ def main() -> None:
             text-overflow: ellipsis;
         }
         .st-key-sb_profile button {
-            background: #ecfdf5 !important;
+            background: linear-gradient(135deg, #ecfdf5 0%, #d1fae5 100%) !important;
             border: 1px solid #a7f3d0 !important;
             color: #065f46 !important;
             font-weight: 700 !important;
-            margin-bottom: 0.4rem !important;
+            margin-bottom: 0.45rem !important;
         }
         .st-key-sb_profile button:hover {
-            background: #d1fae5 !important;
+            background: #a7f3d0 !important;
             border-color: #10b981 !important;
         }
         .sidebar-section-label {
-            margin: 0.75rem 0 0.45rem 0.5rem;
-            color: #64748b !important;
-            font-size: 0.65rem;
+            margin: 0.8rem 0 0.45rem 0.4rem;
+            color: #94a3b8 !important;
+            font-size: 0.64rem;
             font-weight: 800;
-            letter-spacing: 0.12em;
-        }
-        .sidebar-preferences {
-            margin-top: 2rem;
-            padding-top: 1.4rem;
-            border-top: 1px solid #eef1ef;
-        }
-        .sidebar-profile {
-            display: flex;
-            align-items: center;
-            gap: 10px;
-            margin-top: 1rem;
-            padding: 0.6rem 0.3rem;
+            letter-spacing: 0.14em;
         }
         .profile-avatar {
             display: grid;
@@ -2674,47 +2989,55 @@ def main() -> None:
             font-size: 0.8rem;
             font-weight: 700;
         }
-        .sidebar-profile strong {
-            color: #26352f !important;
-            font-size: 0.78rem;
-        }
-        .sidebar-profile small {
-            margin-top: 2px;
-            color: #84918e !important;
-            font-size: 0.68rem;
-        }
+
         /* ── Welcome Hero Banner ── */
         .welcome-hero-banner {
             display: flex;
             align-items: center;
             gap: 18px;
-            padding: 1.25rem 1.5rem;
-            margin-bottom: 0.45rem;
-            border-radius: 22px;
-            background: linear-gradient(135deg, #0b221c 0%, #13392f 55%, #065f46 100%);
-            border: 1px solid rgba(52, 211, 153, 0.25);
-            box-shadow: 0 14px 32px rgba(15, 41, 34, 0.14);
+            padding: 1.35rem 1.6rem;
+            margin-bottom: 0.4rem;
+            border-radius: 24px;
+            background: linear-gradient(135deg, #06231d 0%, #0d3c31 52%, #0f624d 100%);
+            border: 1px solid rgba(52, 211, 153, 0.24);
+            box-shadow: 0 18px 40px rgba(6, 35, 29, 0.16), inset 0 1px 0 rgba(255, 255, 255, 0.08);
             color: #ffffff;
+            position: relative;
+            overflow: hidden;
+        }
+        .welcome-hero-banner::after {
+            content: '';
+            position: absolute;
+            top: -55px;
+            right: -35px;
+            width: 210px;
+            height: 210px;
+            border-radius: 50%;
+            background: radial-gradient(circle, rgba(52, 211, 153, 0.24), transparent 70%);
+            pointer-events: none;
         }
         .welcome-hero-content {
             min-width: 0;
             flex: 1;
+            position: relative;
+            z-index: 1;
         }
         .welcome-date {
             display: flex;
             flex-wrap: wrap;
             align-items: center;
             gap: 8px;
-            margin-bottom: 0.35rem;
+            margin-bottom: 0.4rem;
         }
         .welcome-date-pill {
             display: inline-flex;
             align-items: center;
-            gap: 4px;
-            padding: 3px 11px;
+            gap: 5px;
+            padding: 4px 12px;
             border-radius: 99px;
-            background: rgba(255, 255, 255, 0.12);
+            background: rgba(255, 255, 255, 0.11);
             border: 1px solid rgba(255, 255, 255, 0.18);
+            backdrop-filter: blur(8px);
             color: #d1fae5;
             font-size: 0.72rem;
             font-weight: 600;
@@ -2722,70 +3045,159 @@ def main() -> None:
         .welcome-work-pill {
             display: inline-flex;
             align-items: center;
-            gap: 4px;
-            padding: 3px 11px;
+            gap: 5px;
+            padding: 4px 12px;
             border-radius: 99px;
-            background: rgba(16, 185, 129, 0.25);
+            background: rgba(16, 185, 129, 0.24);
             border: 1px solid rgba(52, 211, 153, 0.4);
+            backdrop-filter: blur(8px);
             color: #ecfdf5;
             font-size: 0.72rem;
             font-weight: 700;
         }
         .welcome-avatar-img {
-            width: 64px;
-            height: 64px;
-            flex: 0 0 64px;
-            border-radius: 50%;
-            object-fit: cover;
+            width: 66px !important;
+            height: 66px !important;
+            min-width: 66px !important;
+            max-width: 66px !important;
+            aspect-ratio: 1 / 1;
+            flex: 0 0 66px !important;
+            display: block !important;
+            border-radius: 50% !important;
+            object-fit: cover !important;
+            object-position: center !important;
             border: 3px solid #34d399;
-            box-shadow: 0 6px 18px rgba(0, 0, 0, 0.28);
+            box-shadow: 0 8px 22px rgba(0, 0, 0, 0.3), 0 0 0 4px rgba(52, 211, 153, 0.16);
+            position: relative;
+            z-index: 1;
         }
         .welcome-avatar-fallback {
             display: grid;
             place-items: center;
-            width: 64px;
-            height: 64px;
-            flex: 0 0 64px;
+            width: 66px;
+            height: 66px;
+            min-width: 66px;
+            flex: 0 0 66px;
             border-radius: 50%;
             background: linear-gradient(135deg, #10b981, #059669);
             color: #ffffff;
             font-size: 1.65rem;
             font-weight: 800;
             border: 2.5px solid rgba(255, 255, 255, 0.35);
-            box-shadow: 0 6px 18px rgba(0, 0, 0, 0.22);
+            box-shadow: 0 8px 20px rgba(0, 0, 0, 0.24);
+            position: relative;
+            z-index: 1;
         }
         .welcome-hero-banner h1 {
-            margin: 0.15rem 0 0.2rem;
+            margin: 0.15rem 0 0.25rem;
             color: #ffffff !important;
             font-size: clamp(1.45rem, 2.3vw, 1.95rem);
             font-weight: 800;
             letter-spacing: -0.035em;
+            line-height: 1.15;
         }
         .welcome-hero-banner p {
             margin: 0;
             color: #a7f3d0;
-            font-size: 0.84rem;
+            font-size: 0.85rem;
+            opacity: 0.94;
+        }
+        .month-select-label {
+            font-size: 0.66rem;
+            font-weight: 800;
+            letter-spacing: 0.12em;
+            color: #64748b;
+            margin: 0 0 0.3rem 0.25rem;
+        }
+        div[data-testid="stSelectbox"] div[data-baseweb="select"] > div {
+            background: #ffffff !important;
+            border: 1.5px solid rgba(15, 23, 42, 0.1) !important;
+            border-radius: 15px !important;
+            min-height: 48px;
+            box-shadow: 0 6px 18px rgba(15, 23, 42, 0.05);
+            color: #0f172a !important;
+            font-weight: 600 !important;
+        }
+        div[data-testid="stSelectbox"] div[data-baseweb="select"] > div:hover {
+            border-color: #10b981 !important;
+        }
+
+        /* ── Section Headings & Chart Legend Pills ── */
+        .section-heading {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin: 0.75rem 0 0.8rem;
+        }
+        .section-heading h2 {
+            margin: 0 0 0.2rem;
+            color: #0f172a;
+            font-size: 1.08rem;
+            font-weight: 800;
+            letter-spacing: -0.02em;
         }
         .section-heading p {
             margin: 0;
             color: #64748b;
-            font-size: 0.84rem;
+            font-size: 0.82rem;
         }
+        .chart-legend-pills {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .legend-pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 4px 11px;
+            border-radius: 99px;
+            background: #ffffff;
+            border: 1px solid rgba(15, 23, 42, 0.08);
+            color: #334155;
+            font-size: 0.72rem;
+            font-weight: 700;
+            box-shadow: 0 2px 6px rgba(15, 23, 42, 0.03);
+        }
+        .legend-pill i {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+        }
+        .legend-income i { background: #10b981; }
+        .legend-expense i { background: #f43f5e; }
+        .recent-heading { margin-top: 1.75rem; }
+        .record-count {
+            padding: 5px 13px;
+            border-radius: 99px;
+            background: #ffffff;
+            border: 1px solid rgba(15, 23, 42, 0.08);
+            color: #334155;
+            font-size: 0.74rem;
+            font-weight: 700;
+            box-shadow: 0 2px 6px rgba(15, 23, 42, 0.03);
+        }
+
         /* ── Page Hero Banner (Receitas / Despesas) ── */
         .page-hero-banner {
             display: flex;
             align-items: center;
             gap: 16px;
             max-width: 720px;
-            margin: 0 auto 1.2rem;
-            padding: 1.25rem 1.5rem;
-            border-radius: 20px;
-            background: linear-gradient(135deg, #0f2922 0%, #065f46 100%);
+            margin: 0 auto 1.25rem;
+            padding: 1.3rem 1.55rem;
+            border-radius: 22px;
+            background: linear-gradient(135deg, #06231d 0%, #0d4a3a 100%);
+            border: 1px solid rgba(52, 211, 153, 0.22);
             color: #ffffff;
-            box-shadow: 0 12px 28px rgba(15, 41, 34, 0.14);
+            box-shadow: 0 14px 32px rgba(6, 35, 29, 0.15);
         }
         .page-hero-expense {
-            background: linear-gradient(135deg, #1e293b 0%, #334155 100%);
+            background: linear-gradient(135deg, #1e1b4b 0%, #312e81 50%, #9f1239 100%);
+            border-color: rgba(251, 113, 133, 0.25);
         }
         .page-hero-icon {
             display: grid;
@@ -2796,6 +3208,7 @@ def main() -> None:
             border-radius: 16px;
             background: rgba(255, 255, 255, 0.14);
             border: 1px solid rgba(255, 255, 255, 0.22);
+            backdrop-filter: blur(8px);
             font-size: 1.55rem;
         }
         .page-hero-banner h2 {
@@ -2806,9 +3219,10 @@ def main() -> None:
         }
         .page-hero-banner p {
             margin: 0;
-            color: #cbd5e1;
+            color: #e2e8f0;
             font-size: 0.84rem;
         }
+
         /* ── Profile Hero Card ── */
         .profile-hero-card {
             display: flex;
@@ -2817,25 +3231,32 @@ def main() -> None:
             max-width: 720px;
             margin: 0.5rem auto 1.25rem;
             padding: 1.5rem 1.75rem;
-            border-radius: 22px;
-            background: linear-gradient(135deg, #0f2922 0%, #173a32 55%, #065f46 100%);
+            border-radius: 24px;
+            background: linear-gradient(135deg, #06231d 0%, #0e3d32 55%, #065f46 100%);
+            border: 1px solid rgba(52, 211, 153, 0.24);
             color: #ffffff;
-            box-shadow: 0 16px 36px rgba(15, 41, 34, 0.18);
+            box-shadow: 0 18px 40px rgba(6, 35, 29, 0.18);
         }
         .profile-page-photo {
-            width: 92px;
-            height: 92px;
-            flex: 0 0 92px;
-            border-radius: 50%;
-            object-fit: cover;
+            width: 92px !important;
+            height: 92px !important;
+            min-width: 92px !important;
+            max-width: 92px !important;
+            aspect-ratio: 1 / 1;
+            flex: 0 0 92px !important;
+            display: block !important;
+            border-radius: 50% !important;
+            object-fit: cover !important;
+            object-position: center !important;
             border: 3px solid #34d399;
-            box-shadow: 0 8px 20px rgba(0, 0, 0, 0.28);
+            box-shadow: 0 10px 24px rgba(0, 0, 0, 0.3);
         }
         .profile-page-avatar {
             display: grid;
             place-items: center;
             width: 92px;
             height: 92px;
+            min-width: 92px;
             flex: 0 0 92px;
             border-radius: 50%;
             background: linear-gradient(135deg, #10b981, #059669);
@@ -2863,14 +3284,15 @@ def main() -> None:
         .profile-badge {
             display: inline-flex;
             align-items: center;
-            padding: 4px 11px;
+            padding: 4px 12px;
             border-radius: 99px;
-            background: rgba(255, 255, 255, 0.14);
+            background: rgba(255, 255, 255, 0.13);
             border: 1px solid rgba(255, 255, 255, 0.22);
             color: #ecfdf5;
             font-size: 0.75rem;
             font-weight: 600;
         }
+
         /* ── Extra Income Banner & List ── */
         .extra-banner {
             background: linear-gradient(135deg, #fffbeb 0%, #fef3c7 100%) !important;
@@ -2885,12 +3307,12 @@ def main() -> None:
             display: flex;
             align-items: center;
             justify-content: space-between;
-            padding: 0.65rem 1rem;
-            margin-bottom: 0.35rem;
-            border-radius: 14px;
+            padding: 0.75rem 1rem;
+            margin-bottom: 0.4rem;
+            border-radius: 15px;
             background: #ffffff;
-            border: 1px solid #e2e8f0;
-            box-shadow: 0 2px 6px rgba(15, 23, 42, 0.03);
+            border: 1px solid rgba(15, 23, 42, 0.08);
+            box-shadow: 0 3px 10px rgba(15, 23, 42, 0.035);
         }
         .extra-item-row strong {
             display: block;
@@ -2908,75 +3330,393 @@ def main() -> None:
             font-size: 0.95rem;
             white-space: nowrap;
         }
-        .section-heading {
+
+        /* ── Metrics Row (4 KPI Cards) ── */
+        .metrics-row {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 16px;
+            margin: 0.8rem 0 1.4rem;
+            width: 100%;
+        }
+        .metrics-row-4 {
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+        }
+        .metric-card {
+            min-width: 0;
+            background: #ffffff;
+            border: 1px solid rgba(15, 23, 42, 0.07);
+            border-radius: 22px;
+            padding: 20px 20px 18px;
+            text-align: left;
+            box-shadow: 0 10px 28px rgba(15, 23, 42, 0.05), 0 1px 3px rgba(15, 23, 42, 0.02);
+            transition: transform 0.22s cubic-bezier(0.4, 0, 0.2, 1), box-shadow 0.22s ease;
+            position: relative;
+            overflow: hidden;
+        }
+        .metric-card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 4px;
+        }
+        .metric-income::before { background: linear-gradient(90deg, #10b981, #34d399); }
+        .metric-extra::before { background: linear-gradient(90deg, #f59e0b, #fbbf24); }
+        .metric-expense::before { background: linear-gradient(90deg, #f43f5e, #fb7185); }
+        .metric-balance::before { background: linear-gradient(90deg, #0284c7, #38bdf8); }
+        .metric-balance-negative::before { background: linear-gradient(90deg, #e11d48, #fb7185); }
+        .metric-card:hover {
+            transform: translateY(-4px);
+            box-shadow: 0 18px 36px rgba(15, 23, 42, 0.09);
+        }
+        .metric-top {
             display: flex;
             align-items: center;
             justify-content: space-between;
-            margin: 0.7rem 0 0.75rem;
+            gap: 8px;
+            margin-bottom: 6px;
         }
-        .section-heading h2 {
-            margin: 0 0 0.25rem;
-            color: #0f172a;
+        .metric-icon-badge {
+            display: grid;
+            place-items: center;
+            width: 36px;
+            height: 36px;
+            flex: 0 0 36px;
+            border-radius: 12px;
+            background: rgba(15, 23, 42, 0.05);
             font-size: 1.05rem;
+        }
+        .metric-income .metric-icon-badge { background: rgba(255, 255, 255, 0.14); }
+        .metric-extra .metric-icon-badge { background: rgba(217, 119, 6, 0.14); }
+        .metric-expense .metric-icon-badge { background: #ffe4e6; }
+        .metric-balance .metric-icon-badge { background: #e0f2fe; }
+        .metric-balance-negative .metric-icon-badge { background: #ffe4e6; }
+        .metric-label {
+            font-size: 0.78rem;
+            font-weight: 700;
+            color: #64748b;
+            line-height: 1.25;
+        }
+        .metric-val {
+            margin: 0.45rem 0 0.5rem;
+            font-size: clamp(1.1rem, 1.65vw, 1.56rem);
             font-weight: 800;
+            letter-spacing: -0.03em;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
         }
-        .recent-heading { margin-top: 1.6rem; }
-        .record-count {
-            padding: 4px 12px;
-            border-radius: 99px;
-            background: #e2e8f0;
-            color: #334155;
-            font-size: 0.74rem;
-            font-weight: 700;
+        .metric-income {
+            background: linear-gradient(135deg, #06231d 0%, #0d3c31 55%, #065f46 100%);
+            border-color: rgba(52, 211, 153, 0.2);
         }
-        .commitment-card {
-            margin-top: 1.1rem;
-            padding: 1.1rem 1.2rem;
-            border: 1px solid #e2e8f0;
-            border-radius: 18px;
-            background: linear-gradient(135deg, #ffffff 0%, #f8fafc 100%);
-            box-shadow: 0 6px 18px rgba(15, 23, 42, 0.04);
+        .metric-income .metric-label { color: #a7f3d0; }
+        .metric-income .metric-val { color: #ffffff; }
+        .metric-income .metric-note { color: #6ee7b7; }
+        .metric-extra {
+            background: linear-gradient(145deg, #ffffff 0%, #fffbeb 100%);
+            border-color: #fde68a;
         }
-        .commitment-title {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 0.75rem;
-            color: #334155;
-            font-size: 0.8rem;
-            font-weight: 700;
+        .metric-extra .metric-label { color: #92400e; }
+        .metric-extra .metric-val { color: #b45309; }
+        .metric-extra .metric-note { color: #b45309; font-weight: 600; }
+        .metric-expense {
+            background: linear-gradient(145deg, #ffffff 0%, #fff1f2 100%);
+            border-color: rgba(244, 63, 94, 0.18);
         }
-        .commitment-title strong { color: #059669; font-size: 1rem; font-weight: 800; }
-        .commitment-card small { display: block; margin-top: 0.65rem; color: #64748b; font-size: 0.72rem; }
+        .metric-expense .metric-label { color: #9f1239; }
+        .metric-expense .metric-val { color: #0f172a; }
+        .metric-balance {
+            background: linear-gradient(145deg, #ffffff 0%, #f0f9ff 100%);
+            border-color: #bae6fd;
+        }
+        .metric-balance .metric-label { color: #0369a1; }
+        .metric-balance .metric-val { color: #0c4a6e; }
+        .metric-balance .metric-note { color: #0284c7; font-weight: 600; }
+        .metric-balance-negative {
+            background: linear-gradient(145deg, #ffffff 0%, #fff1f2 100%);
+            border-color: #fecdd3;
+        }
+        .metric-balance-negative .metric-label { color: #be123c; }
+        .metric-balance-negative .metric-val { color: #be123c; }
+        .metric-balance-negative .metric-note { color: #e11d48; }
+        .metric-note {
+            color: #64748b;
+            font-size: 0.72rem;
+            line-height: 1.35;
+        }
+        .metric-expense .metric-progress { margin-top: 0.65rem; }
+
+        /* ── Progress Bars ── */
         .metric-progress {
             height: 8px;
             overflow: hidden;
             border-radius: 99px;
-            background: #e2e8f0;
+            background: rgba(15, 23, 42, 0.08);
         }
         .metric-progress span {
             display: block;
             height: 100%;
             border-radius: inherit;
             background: linear-gradient(90deg, #10b981, #059669);
+            transition: width 0.35s ease;
+        }
+        .metric-progress-warn span {
+            background: linear-gradient(90deg, #f59e0b, #ea580c);
+        }
+        .metric-progress-danger span {
+            background: linear-gradient(90deg, #f43f5e, #e11d48);
+        }
+
+        /* ── Chart Container (Vega-Lite / Altair) ── */
+        div[data-testid="stVegaLiteChart"] {
+            background: #ffffff;
+            border: 1px solid rgba(15, 23, 42, 0.08);
+            border-radius: 22px;
+            padding: 0.9rem 1rem 0.75rem;
+            box-shadow: 0 12px 30px rgba(15, 23, 42, 0.05);
+            box-sizing: border-box;
+            width: 100%;
+            overflow: hidden;
+        }
+        div[data-testid="stVegaLiteChart"] .vega-embed,
+        div[data-testid="stVegaLiteChart"] canvas,
+        div[data-testid="stVegaLiteChart"] svg {
+            max-width: 100% !important;
+        }
+
+        /* ── Category Mini Summary Card ── */
+        .cat-summary-card {
+            margin-top: 0.95rem;
+            padding: 1.1rem 1.25rem;
+            border-radius: 20px;
+            background: #ffffff;
+            border: 1px solid rgba(15, 23, 42, 0.08);
+            box-shadow: 0 10px 26px rgba(15, 23, 42, 0.045);
+        }
+        .cat-summary-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 0.85rem;
+        }
+        .cat-summary-header strong {
+            font-family: 'Plus Jakarta Sans', 'Inter', sans-serif;
+            font-size: 0.92rem;
+            font-weight: 800;
+            color: #0f172a;
+        }
+        .cat-summary-header span {
+            font-size: 0.72rem;
+            font-weight: 700;
+            color: #64748b;
+            background: #f1f5f9;
+            padding: 3px 10px;
+            border-radius: 99px;
+        }
+        .cat-mini-row {
+            margin-bottom: 0.72rem;
+        }
+        .cat-mini-row:last-child {
+            margin-bottom: 0;
+        }
+        .cat-mini-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            margin-bottom: 0.3rem;
+        }
+        .cat-mini-name {
+            display: inline-flex;
+            align-items: center;
+            gap: 7px;
+            font-size: 0.81rem;
+            font-weight: 600;
+            color: #334155;
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .cat-mini-name i {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            flex: 0 0 8px;
+            border-radius: 50%;
+        }
+        .cat-mini-val {
+            font-size: 0.81rem;
+            font-weight: 800;
+            color: #0f172a;
+            white-space: nowrap;
+        }
+        .cat-mini-val small {
+            font-weight: 600;
+            color: #64748b;
+        }
+        .cat-mini-track {
+            height: 7px;
+            border-radius: 99px;
+            background: #f1f5f9;
+            overflow: hidden;
+        }
+        .cat-mini-track span {
+            display: block;
+            height: 100%;
+            border-radius: inherit;
+        }
+
+        /* ── Quick Actions & Commitment Card ── */
+        .st-key-quick_add_salary button {
+            border-left: 4px solid #10b981 !important;
+        }
+        .st-key-quick_add_vale button {
+            border-left: 4px solid #0284c7 !important;
+        }
+        .st-key-quick_add_extra button {
+            border-left: 4px solid #f59e0b !important;
+        }
+        .st-key-quick_add_expense button {
+            background: linear-gradient(135deg, #fff1f2 0%, #ffe4e6 100%) !important;
+            border: 1.5px solid #fda4af !important;
+            border-left: 4px solid #f43f5e !important;
+            color: #be123c !important;
+            font-weight: 700 !important;
+        }
+        .st-key-quick_add_expense button:hover {
+            background: linear-gradient(135deg, #ffe4e6 0%, #fecdd3 100%) !important;
+            border-color: #f43f5e !important;
+            color: #9f1239 !important;
+        }
+        .st-key-quick_open_profile button {
+            border-left: 4px solid #6366f1 !important;
+        }
+        .commitment-card {
+            margin-top: 0.95rem;
+            padding: 1.15rem 1.25rem;
+            border: 1px solid rgba(15, 23, 42, 0.08);
+            border-radius: 20px;
+            background: linear-gradient(155deg, #ffffff 0%, #f8fafc 100%);
+            box-shadow: 0 10px 26px rgba(15, 23, 42, 0.045);
+        }
+        .commitment-top {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 0.35rem;
+        }
+        .commitment-label {
+            color: #475569;
+            font-size: 0.8rem;
+            font-weight: 700;
+        }
+        .commitment-badge {
+            padding: 3px 9px;
+            border-radius: 99px;
+            font-size: 0.68rem;
+            font-weight: 800;
+        }
+        .commitment-badge-ok { background: #dcfce7; color: #15803d; }
+        .commitment-badge-warn { background: #fef3c7; color: #b45309; }
+        .commitment-badge-danger { background: #ffe4e6; color: #be123c; }
+        .commitment-value {
+            font-size: 1.55rem;
+            font-weight: 800;
+            color: #0f172a;
+            letter-spacing: -0.03em;
+            margin: 0.1rem 0 0.6rem;
+        }
+        .commitment-card small {
+            display: block;
+            margin-top: 0.65rem;
+            color: #64748b;
+            font-size: 0.74rem;
+        }
+
+        /* ── Recent Transaction Cards ── */
+        .record-row-card {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 14px;
+            padding: 0.82rem 1.05rem;
+            border-radius: 16px;
+            background: #ffffff;
+            border: 1px solid rgba(15, 23, 42, 0.07);
+            box-shadow: 0 4px 14px rgba(15, 23, 42, 0.035);
+            transition: border-color 0.18s ease, box-shadow 0.18s ease;
+        }
+        .record-row-card:hover {
+            border-color: rgba(16, 185, 129, 0.35);
+            box-shadow: 0 8px 20px rgba(15, 23, 42, 0.06);
+        }
+        .record-row-left {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            min-width: 0;
+            flex: 1;
         }
         .record-icon {
             display: grid;
-            width: 38px;
-            height: 38px;
+            width: 40px;
+            height: 40px;
+            flex: 0 0 40px;
             place-items: center;
-            border-radius: 12px;
+            border-radius: 13px;
             font-weight: 800;
-            font-size: 1rem;
+            font-size: 1.05rem;
         }
         .record-icon.income { background: #dcfce7; color: #15803d; }
-        .record-icon.expense { background: #fee2e2; color: #b91c1c; }
-        .record-description strong, .record-description small { display: block; }
-        .record-description strong { color: #0f172a; font-size: 0.86rem; font-weight: 700; }
-        .record-description small { margin-top: 3px; color: #64748b; font-size: 0.72rem; }
-        .record-amount { text-align: right; font-size: 0.88rem; font-weight: 800; }
+        .record-icon.expense { background: #ffe4e6; color: #be123c; }
+        .record-description {
+            min-width: 0;
+            flex: 1;
+        }
+        .record-description strong {
+            display: block;
+            color: #0f172a;
+            font-size: 0.9rem;
+            font-weight: 700;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .record-meta {
+            display: flex;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 6px;
+            margin-top: 3px;
+        }
+        .record-cat-pill {
+            display: inline-flex;
+            align-items: center;
+            padding: 2px 8px;
+            border-radius: 99px;
+            background: #f1f5f9;
+            color: #475569;
+            font-size: 0.7rem;
+            font-weight: 600;
+        }
+        .record-date-text {
+            color: #94a3b8;
+            font-size: 0.72rem;
+            font-weight: 500;
+        }
+        .record-amount {
+            text-align: right;
+            font-size: 0.94rem;
+            font-weight: 800;
+            white-space: nowrap;
+        }
         .record-amount.income { color: #059669; }
-        .record-amount.expense { color: #dc2626; }
+        .record-amount.expense { color: #e11d48; }
 
         /* ── Form Cards ── */
         div[data-testid="stForm"] {
@@ -2985,10 +3725,10 @@ def main() -> None:
             margin-right: auto;
             margin-left: auto;
             background: #ffffff !important;
-            border: 1px solid rgba(0,0,0,0.06) !important;
-            border-radius: 20px !important;
-            padding: 2rem 1.8rem !important;
-            box-shadow: 0 20px 40px rgba(0, 0, 0, 0.04), 0 1px 3px rgba(0, 0, 0, 0.03) !important;
+            border: 1px solid rgba(15, 23, 42, 0.07) !important;
+            border-radius: 22px !important;
+            padding: 2rem 1.85rem !important;
+            box-shadow: 0 20px 44px rgba(15, 23, 42, 0.06), 0 1px 3px rgba(15, 23, 42, 0.03) !important;
         }
         .st-key-login_form,
         .st-key-register_form,
@@ -3010,7 +3750,7 @@ def main() -> None:
         }
         div[data-testid="stTabs"] button[data-baseweb="tab"] {
             font-weight: 700 !important;
-            font-size: 0.96rem !important;
+            font-size: 0.94rem !important;
             color: #475569 !important;
             padding: 0.65rem 1.2rem !important;
         }
@@ -3024,7 +3764,7 @@ def main() -> None:
             max-width: 720px;
             margin: 0.5rem auto 1rem;
             padding: 1rem 1.25rem;
-            border-radius: 16px;
+            border-radius: 18px;
             background: linear-gradient(135deg, #ecfdf5 0%, #d1fae5 100%);
             border: 1px solid #a7f3d0;
             color: #064e3b;
@@ -3079,12 +3819,12 @@ def main() -> None:
         }
         div[data-baseweb="input"]:focus-within {
             border-color: #10b981 !important;
-            box-shadow: 0 0 0 4px rgba(16, 185, 129, 0.12) !important;
+            box-shadow: 0 0 0 4px rgba(16, 185, 129, 0.14) !important;
         }
         div[data-testid="stTextInput"] input {
-            font-size: 1rem !important;
-            caret-color: #126b55 !important;
-            padding: 0.6rem 0.85rem !important;
+            font-size: 0.98rem !important;
+            caret-color: #059669 !important;
+            padding: 0.62rem 0.9rem !important;
         }
         div[data-testid="stTextInput"] input::placeholder {
             color: #94a3b8 !important;
@@ -3093,63 +3833,66 @@ def main() -> None:
         }
         div[data-testid="stTextInput"] label {
             font-weight: 600 !important;
-            font-size: 0.88rem !important;
+            font-size: 0.86rem !important;
             color: #334155 !important;
-            letter-spacing: 0.01em !important;
         }
 
         /* ── Buttons ── */
         div.stButton > button {
+            background: #ffffff;
+            color: #1e293b;
             border-radius: 14px !important;
-            min-height: 46px;
+            min-height: 45px;
             font-weight: 600 !important;
-            font-size: 0.95rem !important;
+            font-size: 0.9rem !important;
+            white-space: nowrap;
             transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1) !important;
-            border: 1.5px solid #e2e8f0 !important;
+            border: 1.5px solid rgba(15, 23, 42, 0.1) !important;
+            box-shadow: 0 2px 6px rgba(15, 23, 42, 0.03);
         }
         div.stButton > button[kind="primary"] {
-            background: linear-gradient(135deg, #059669 0%, #126b55 100%) !important;
+            background: linear-gradient(135deg, #059669 0%, #0d9488 100%) !important;
             border: none !important;
             color: #ffffff !important;
             font-weight: 700 !important;
-            box-shadow: 0 4px 16px rgba(5, 150, 105, 0.25) !important;
+            box-shadow: 0 6px 18px rgba(5, 150, 105, 0.28) !important;
         }
         div.stButton > button[kind="primary"]:hover {
-            background: linear-gradient(135deg, #047857 0%, #0e5644 100%) !important;
-            box-shadow: 0 8px 24px rgba(5, 150, 105, 0.35) !important;
+            background: linear-gradient(135deg, #047857 0%, #0f766e 100%) !important;
+            box-shadow: 0 10px 26px rgba(5, 150, 105, 0.36) !important;
             transform: translateY(-2px) !important;
         }
         div.stButton > button:hover {
             border-color: #10b981 !important;
-            color: #059669 !important;
+            color: #047857 !important;
             background: #f0fdf4 !important;
             transform: translateY(-1px) !important;
         }
 
         /* ── Form Primary Buttons ── */
         div[data-testid="stForm"] div.stButton > button[kind="primary"] {
-            background: linear-gradient(135deg, #059669 0%, #126b55 100%) !important;
+            background: linear-gradient(135deg, #059669 0%, #0d9488 100%) !important;
             color: #ffffff !important;
             font-weight: 700 !important;
-            font-size: 1.05rem !important;
+            font-size: 1rem !important;
             border-radius: 14px !important;
             min-height: 50px !important;
             border: none !important;
-            box-shadow: 0 6px 20px rgba(5, 150, 105, 0.3) !important;
+            box-shadow: 0 8px 22px rgba(5, 150, 105, 0.3) !important;
             margin-top: 0.5rem !important;
         }
         div[data-testid="stForm"] div.stButton > button[kind="primary"]:hover {
-            background: linear-gradient(135deg, #047857 0%, #0e5644 100%) !important;
-            box-shadow: 0 8px 28px rgba(5, 150, 105, 0.4) !important;
+            background: linear-gradient(135deg, #047857 0%, #0f766e 100%) !important;
+            box-shadow: 0 10px 28px rgba(5, 150, 105, 0.38) !important;
             transform: translateY(-2px) !important;
         }
 
         /* ── Auth Switch Buttons ── */
         .st-key-btn_switch_register button, .st-key-btn_switch_login button {
             background: #ffffff !important;
-            border: 1.5px solid #d1d5db !important;
+            border: 1.5px solid #cbd5e1 !important;
             color: #059669 !important;
-            font-weight: 600 !important;
+            font-weight: 700 !important;
             border-radius: 14px !important;
             min-height: 46px !important;
             margin-bottom: 1rem !important;
@@ -3160,159 +3903,17 @@ def main() -> None:
             transform: translateY(-1px) !important;
         }
 
-        /* ── Amounts ── */
+        /* ── Amounts & Containers ── */
         .amount { text-align: right; font-weight: 700; padding-top: .4rem; font-size: 1.05rem; }
         .income { color: #059669; }
-        .expense { color: #dc2626; }
-
-        /* ── Containers with border ── */
+        .expense { color: #e11d48; }
         div[data-testid="stVerticalBlockBorderWrapper"] {
-            border: 1px solid rgba(226,232,240,0.9) !important;
-            border-radius: 18px !important;
+            border: 1px solid rgba(15, 23, 42, 0.08) !important;
+            border-radius: 20px !important;
             overflow: hidden;
-            background: rgba(255,255,255,0.92);
-            box-shadow: 0 5px 18px rgba(15,23,42,0.035);
+            background: rgba(255, 255, 255, 0.94);
+            box-shadow: 0 6px 20px rgba(15, 23, 42, 0.04);
         }
-
-        /* ── User Menu Box ── */
-        .user-menu-box {
-            text-align: center;
-            padding: 0.6rem 0 1rem;
-            border-bottom: 1px solid #f1f5f9;
-            margin-bottom: 1rem;
-        }
-        .user-menu-avatar {
-            width: 52px;
-            height: 52px;
-            border-radius: 50%;
-            background: linear-gradient(135deg, #d1fae5 0%, #a7f3d0 100%);
-            display: inline-flex;
-            align-items: center;
-            justify-content: center;
-            font-size: 1.6rem;
-            margin-bottom: 0.5rem;
-            box-shadow: 0 4px 12px rgba(16, 185, 129, 0.15);
-        }
-        .user-menu-name {
-            font-weight: 800;
-            font-size: 1.1rem;
-            color: #0f172a;
-            letter-spacing: -0.01em;
-        }
-        .user-menu-handle {
-            font-size: 0.8rem;
-            color: #64748b;
-            font-weight: 500;
-        }
-
-        /* ── Metrics Row ── */
-        .metrics-row {
-            display: grid;
-            grid-template-columns: repeat(3, minmax(0, 1fr));
-            gap: 16px;
-            margin: 0.7rem 0 1.25rem;
-            width: 100%;
-        }
-        .metrics-row-4 {
-            grid-template-columns: repeat(4, minmax(0, 1fr));
-        }
-        .metric-card {
-            flex: 1;
-            min-width: 0;
-            background: #ffffff;
-            border: 1px solid rgba(15, 23, 42, 0.07);
-            border-radius: 22px;
-            padding: 20px 21px;
-            text-align: left;
-            box-shadow: 0 10px 26px rgba(15,23,42,0.05), 0 1px 3px rgba(15,23,42,0.02);
-            transition: all 0.22s cubic-bezier(0.4, 0, 0.2, 1);
-            position: relative;
-            overflow: hidden;
-        }
-        .metric-card::before {
-            content: '';
-            position: absolute;
-            top: 0;
-            left: 0;
-            right: 0;
-            height: 4px;
-        }
-        .metric-income::before { background: linear-gradient(90deg, #10b981, #34d399); }
-        .metric-extra::before { background: linear-gradient(90deg, #f59e0b, #fbbf24); }
-        .metric-expense::before { background: linear-gradient(90deg, #ef4444, #f87171); }
-        .metric-balance::before { background: linear-gradient(90deg, #0284c7, #38bdf8); }
-        .metric-card:hover {
-            transform: translateY(-4px);
-            box-shadow: 0 16px 34px rgba(15, 23, 42, 0.10);
-        }
-        .metric-top {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            gap: 8px;
-            margin-bottom: 4px;
-        }
-        .metric-icon-badge {
-            display: grid;
-            place-items: center;
-            width: 34px;
-            height: 34px;
-            flex: 0 0 34px;
-            border-radius: 11px;
-            background: rgba(15, 23, 42, 0.05);
-            font-size: 1rem;
-        }
-        .metric-income .metric-icon-badge {
-            background: rgba(255, 255, 255, 0.14);
-        }
-        .metric-extra .metric-icon-badge {
-            background: rgba(217, 119, 6, 0.15);
-        }
-        .metric-expense .metric-icon-badge {
-            background: #fee2e2;
-        }
-        .metric-balance .metric-icon-badge {
-            background: #e0f2fe;
-        }
-        .metric-label {
-            font-size: 0.78rem;
-            font-weight: 700;
-            color: #64748b;
-            margin-bottom: 0;
-            text-transform: none;
-            letter-spacing: 0;
-        }
-        .metric-val {
-            margin: 0.55rem 0;
-            font-size: clamp(1.22rem, 2.2vw, 1.68rem);
-            font-weight: 800;
-            letter-spacing: -0.03em;
-            white-space: nowrap;
-        }
-        .metric-income {
-            background: linear-gradient(135deg, #0b221c 0%, #13392f 55%, #065f46 100%);
-            border-color: #13392f;
-        }
-        .metric-income .metric-label { color: #a7f3d0; }
-        .metric-income .metric-val { color: #ffffff; }
-        .metric-income .metric-note { color: #6ee7b7; }
-        .metric-extra {
-            background: linear-gradient(135deg, #fffbeb 0%, #fef3c7 100%);
-            border-color: #fde68a;
-        }
-        .metric-extra .metric-label { color: #92400e; }
-        .metric-extra .metric-val { color: #b45309; }
-        .metric-extra .metric-note { color: #b45309; font-weight: 600; }
-        .metric-expense .metric-val { color: #0f172a; }
-        .metric-balance {
-            background: linear-gradient(135deg, #f0f9ff 0%, #e0f2fe 100%);
-            border-color: #bae6fd;
-        }
-        .metric-balance .metric-label { color: #0369a1; }
-        .metric-balance .metric-val { color: #0c4a6e; }
-        .metric-balance .metric-note { color: #0284c7; font-weight: 600; }
-        .metric-note { color: #64748b; font-size: 0.72rem; }
-        .metric-expense .metric-progress { margin-top: 0.75rem; }
 
         /* ── Logout Button ── */
         .st-key-logout_button {
@@ -3322,42 +3923,32 @@ def main() -> None:
             z-index: 1001;
         }
         .st-key-logout_button button {
-            min-height: 44px;
-            border-radius: 22px !important;
+            min-height: 42px;
+            border-radius: 99px !important;
             padding: 0 18px;
-            background: #ffffff !important;
-            border: 1.5px solid #e2e8f0 !important;
+            background: rgba(255, 255, 255, 0.92) !important;
+            border: 1.5px solid rgba(15, 23, 42, 0.1) !important;
             color: #64748b !important;
             font-weight: 600 !important;
-            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.08) !important;
-            backdrop-filter: blur(8px);
+            box-shadow: 0 8px 24px rgba(15, 23, 42, 0.1) !important;
+            backdrop-filter: blur(10px);
         }
         .st-key-logout_button button:hover {
-            background: #fef2f2 !important;
-            color: #dc2626 !important;
-            border-color: #fca5a5 !important;
+            background: #fff1f2 !important;
+            color: #e11d48 !important;
+            border-color: #fda4af !important;
         }
 
-        /* ── Progress Bar ── */
+        /* ── Expanders & Progress ── */
         div[data-testid="stProgress"] > div > div > div {
             background: linear-gradient(90deg, #059669, #10b981) !important;
             border-radius: 8px !important;
         }
-
-        /* ── Expanders ── */
         details {
-            border: 1px solid #e2e8f0 !important;
-            border-radius: 14px !important;
+            border: 1px solid rgba(15, 23, 42, 0.08) !important;
+            border-radius: 16px !important;
             background: #ffffff !important;
-        }
-
-        /* ── Bar Chart ── */
-        div[data-testid="stVegaLiteChart"] {
-            background: #ffffff;
-            border: 1px solid #e2e8f0;
-            border-radius: 20px;
-            padding: 0.85rem;
-            box-shadow: 0 8px 22px rgba(15,23,42,0.045);
+            box-shadow: 0 4px 14px rgba(15, 23, 42, 0.03);
         }
 
         /* ── AI Chat Section ── */
@@ -3365,29 +3956,44 @@ def main() -> None:
             display: flex;
             align-items: center;
             gap: 16px;
-            margin-top: 1.8rem;
-            margin-bottom: 0.75rem;
-            padding: 1.15rem 1.4rem;
-            border-radius: 20px;
-            background: linear-gradient(135deg, #0f2922 0%, #134e4a 60%, #0f766e 100%);
+            margin-top: 2rem;
+            margin-bottom: 0.85rem;
+            padding: 1.25rem 1.5rem;
+            border-radius: 22px;
+            background: linear-gradient(135deg, #06231d 0%, #114b46 58%, #0f766e 100%);
+            border: 1px solid rgba(52, 211, 153, 0.25);
             color: #ffffff;
-            box-shadow: 0 12px 28px rgba(15, 41, 34, 0.14);
+            box-shadow: 0 16px 34px rgba(6, 35, 29, 0.16);
+            position: relative;
+            overflow: hidden;
+        }
+        .ai-banner-card::after {
+            content: '';
+            position: absolute;
+            right: -30px;
+            bottom: -45px;
+            width: 170px;
+            height: 170px;
+            border-radius: 50%;
+            background: radial-gradient(circle, rgba(45, 212, 191, 0.22), transparent 70%);
+            pointer-events: none;
         }
         .ai-banner-icon {
             display: grid;
             place-items: center;
-            width: 48px;
-            height: 48px;
-            flex: 0 0 48px;
-            border-radius: 15px;
+            width: 50px;
+            height: 50px;
+            flex: 0 0 50px;
+            border-radius: 16px;
             background: rgba(255, 255, 255, 0.14);
             border: 1px solid rgba(255, 255, 255, 0.22);
+            backdrop-filter: blur(8px);
             font-size: 1.45rem;
         }
         .ai-banner-badge {
             display: inline-block;
-            padding: 2px 9px;
-            margin-bottom: 4px;
+            padding: 3px 10px;
+            margin-bottom: 5px;
             border-radius: 99px;
             background: rgba(52, 211, 153, 0.22);
             border: 1px solid rgba(52, 211, 153, 0.4);
@@ -3397,21 +4003,21 @@ def main() -> None:
             letter-spacing: 0.08em;
         }
         .ai-banner-card h3 {
-            margin: 0 0 2px;
+            margin: 0 0 3px;
             color: #ffffff !important;
-            font-size: 1.15rem;
+            font-size: 1.18rem;
             font-weight: 800;
         }
         .ai-banner-card p {
             margin: 0;
             color: #ccfbf1;
-            font-size: 0.8rem;
+            font-size: 0.82rem;
         }
         [data-testid="stChatMessage"] {
-            border: 1px solid #e2e8f0;
+            border: 1px solid rgba(15, 23, 42, 0.08);
             border-radius: 18px;
             background: #ffffff;
-            box-shadow: 0 4px 14px rgba(15,23,42,0.035);
+            box-shadow: 0 4px 14px rgba(15, 23, 42, 0.04);
         }
         .st-key-chip_maior_gasto button,
         .st-key-chip_saldo button,
@@ -3421,10 +4027,10 @@ def main() -> None:
             border: 1.5px solid #a7f3d0 !important;
             color: #065f46 !important;
             font-weight: 700 !important;
-            font-size: 0.84rem !important;
+            font-size: 0.83rem !important;
             border-radius: 99px !important;
-            min-height: 40px !important;
-            box-shadow: 0 2px 8px rgba(16, 185, 129, 0.08) !important;
+            min-height: 41px !important;
+            box-shadow: 0 3px 10px rgba(16, 185, 129, 0.08) !important;
         }
         .st-key-chip_maior_gasto button:hover,
         .st-key-chip_saldo button:hover,
@@ -3435,139 +4041,122 @@ def main() -> None:
             transform: translateY(-2px) !important;
         }
 
-        /* ── Gestão Financeira Button ── */
-        .st-key-btn_gestao_financeira button {
-            background: #ffffff !important;
-            border: 1.5px solid #e0e7ff !important;
-            color: #4f46e5 !important;
-            font-weight: 600 !important;
-        }
-        .st-key-btn_gestao_financeira button:hover {
-            background: #eef2ff !important;
-            border-color: #818cf8 !important;
-        }
-
-        /* ── Add Expense Center Button ── */
-        .st-key-btn_center_add_expense button {
-            font-size: 1.1rem !important;
-            min-height: 52px !important;
-            font-weight: 700 !important;
-            border-radius: 16px !important;
+        /* ── Responsive Tablet / Laptop with open Sidebar ── */
+        @media (max-width: 1120px) {
+            .metrics-row-4 {
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+            }
+            .metric-val {
+                font-size: clamp(1.15rem, 2.4vw, 1.5rem);
+            }
         }
 
         /* ── Responsive Mobile ── */
         @media (max-width: 640px) {
             .block-container {
                 max-width: 100% !important;
-                padding: 0.65rem 0.7rem 2rem !important;
+                padding: 0.75rem 0.75rem 2.2rem !important;
             }
             [data-testid="stSidebar"] {
                 min-width: 17rem;
             }
-            .metrics-row {
-                grid-template-columns: 1fr;
-                gap: 9px;
+            .welcome-hero-banner {
+                padding: 1.05rem 1.1rem;
+                gap: 12px;
+                border-radius: 18px;
+            }
+            .welcome-avatar-img,
+            .welcome-avatar-fallback {
+                width: 52px !important;
+                height: 52px !important;
+                min-width: 52px !important;
+                max-width: 52px !important;
+                flex: 0 0 52px !important;
+                font-size: 1.3rem;
+            }
+            .welcome-hero-banner h1 {
+                font-size: 1.25rem;
+            }
+            .welcome-hero-banner p {
+                font-size: 0.78rem;
+            }
+            .metrics-row,
+            .metrics-row-4 {
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+                gap: 10px;
+                margin: 0.7rem 0 1rem;
             }
             .metric-card {
-                padding: 15px 16px;
+                padding: 14px 12px;
+                border-radius: 16px;
             }
-            .metric-balance {
-                grid-column: auto;
+            .metric-icon-badge {
+                width: 30px;
+                height: 30px;
+                flex: 0 0 30px;
+                border-radius: 9px;
+                font-size: 0.9rem;
+            }
+            .metric-label {
+                font-size: 0.7rem;
             }
             .metric-val {
-                font-size: 1.35rem;
+                font-size: clamp(0.95rem, 4.2vw, 1.18rem);
+            }
+            .metric-note {
+                font-size: 0.68rem;
+            }
+            .chart-legend-pills {
+                display: none;
+            }
+            div[data-testid="stVegaLiteChart"] {
+                padding: 0.55rem 0.45rem;
+                border-radius: 16px;
+            }
+            .record-row-card {
+                padding: 0.72rem 0.85rem;
+                gap: 10px;
+                border-radius: 14px;
+            }
+            .record-icon {
+                width: 34px;
+                height: 34px;
+                flex: 0 0 34px;
+                border-radius: 10px;
+                font-size: 0.92rem;
+            }
+            .record-description strong {
+                font-size: 0.82rem;
+            }
+            .record-amount {
+                font-size: 0.82rem;
             }
             .record-count {
                 display: none;
             }
-            .record-description strong {
-                font-size: 0.72rem;
-            }
-            .record-amount {
-                font-size: 0.68rem;
-                white-space: nowrap;
-            }
-            .st-key-quick_add_salary button,
-            .st-key-quick_add_expense button {
-                min-height: 42px !important;
-                font-size: 0.8rem !important;
+            div.stButton > button {
+                min-height: 44px;
+                font-size: 0.85rem !important;
             }
             div[data-testid="stForm"] {
                 max-width: 100%;
-                padding: 1.1rem 0.9rem !important;
-                border-radius: 16px !important;
-            }
-            .brand h1 {
-                font-size: clamp(1.55rem, 7vw, 1.9rem);
-            }
-            .brand p {
-                font-size: 0.86rem;
+                padding: 1.2rem 1rem !important;
+                border-radius: 18px !important;
             }
             .brand {
                 padding: 1.4rem 0 1rem;
             }
-            .dashboard-heading {
-                padding: 0.85rem 0.8rem;
-                border-radius: 16px;
-                gap: 0.5rem;
+            .brand h1 {
+                font-size: clamp(1.6rem, 7vw, 2rem);
             }
-            .dashboard-mark {
-                width: 40px;
-                height: 40px;
-                flex-basis: 40px;
-                border-radius: 13px;
-                font-size: 1.2rem;
-            }
-            .dashboard-heading p {
-                font-size: 0.78rem;
-            }
-            .dashboard-eyebrow {
-                font-size: 0.59rem;
-                letter-spacing: 0.08em;
-            }
-            .metrics-row {
-                grid-template-columns: repeat(2, minmax(0, 1fr));
-                gap: 8px;
-                margin: 0.65rem 0 0.9rem;
-            }
-            .metric-card {
-                padding: 13px 8px;
-                border-radius: 14px;
-            }
-            .metric-balance {
-                grid-column: 1 / -1;
-            }
-            .metric-label {
-                font-size: 0.67rem;
-                letter-spacing: 0.05em;
-            }
-            .metric-val {
-                font-size: clamp(0.86rem, 4vw, 1.12rem);
-            }
-            div.stButton > button {
-                min-height: 48px;
-                font-size: 0.93rem !important;
+            .brand p {
+                font-size: 0.86rem;
             }
             .st-key-logout_button {
                 position: static !important;
                 display: flex;
                 justify-content: flex-end;
-                margin-top: 0.8rem;
-            }
-            .st-key-logout_button button {
-                min-height: 44px;
-                padding: 0 16px;
-                font-size: 0.85rem !important;
-            }
-            .st-key-btn_center_add_expense button {
-                min-height: 54px !important;
-            }
-            div[data-testid="stVerticalBlockBorderWrapper"] {
-                border-radius: 15px !important;
-            }
-            div[data-testid="stVegaLiteChart"] {
-                padding: 0.35rem;
-                border-radius: 14px;
+                margin-top: 0.9rem;
             }
             [data-testid="stChatMessage"] {
                 padding: 0.65rem 0.75rem;
@@ -3575,40 +4164,31 @@ def main() -> None:
             }
             .st-key-chip_maior_gasto button,
             .st-key-chip_saldo button,
+            .st-key-chip_bicos button,
             .st-key-chip_dica button {
-                min-height: 44px !important;
-                font-size: 0.76rem !important;
-                padding-left: 0.25rem !important;
-                padding-right: 0.25rem !important;
+                min-height: 40px !important;
+                font-size: 0.75rem !important;
+                padding-left: 0.3rem !important;
+                padding-right: 0.3rem !important;
             }
             [data-testid="stHorizontalBlock"] {
                 gap: 0.45rem !important;
             }
-            .user-menu-avatar {
-                width: 42px;
-                height: 42px;
-                font-size: 1.3rem;
-            }
         }
-        @media (max-width: 360px) {
+        @media (max-width: 380px) {
             .block-container {
                 padding-right: 0.5rem !important;
                 padding-left: 0.5rem !important;
             }
-            .metrics-row {
-                gap: 6px;
+            .metrics-row,
+            .metrics-row-4 {
+                gap: 8px;
             }
             .metric-card {
-                padding-right: 5px;
-                padding-left: 5px;
+                padding: 12px 10px;
             }
             .metric-val {
-                font-size: 0.82rem;
-            }
-            .st-key-chip_maior_gasto button,
-            .st-key-chip_saldo button,
-            .st-key-chip_dica button {
-                font-size: 0.69rem !important;
+                font-size: 0.9rem;
             }
         }
         </style>
